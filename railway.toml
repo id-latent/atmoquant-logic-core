@@ -1,0 +1,10 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python main.py"
+healthcheckPath = ""
+restartPolicy = "on_failure"
+restartPolicyMaxRetries = 10
+
