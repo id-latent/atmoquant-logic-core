@@ -50,7 +50,7 @@ async def _post(payload: dict, target: str = "terminal") -> bool:
         log.error(f"Discord delivery failed: {str(e)}")
         return False
 
-# ─── CHANNEL 1: TRADES (#📈-aql-trades) ───────────────────────────────────────
+# ─── CHANNEL : TRADES (#📈-aql-trades) ───────────────────────────────────────
 async def notify_trade_executed(market_name: str, side: str, price: float, size_usd: float, 
                                 edge_pct: float, ev_usd: float, kelly_fraction: float, 
                                 market_url: str, order_id: Optional[str] = None) -> None:
@@ -80,7 +80,7 @@ async def notify_trade_executed(market_name: str, side: str, price: float, size_
     await _post(_wrap([embed]), target="trades")
     log.info("[Discord] Trade log sent to TRADES channel.")
 
-# ─── CHANNEL 2: WEATHER (#☁-weather-data) ────────────────────────────────────
+# ─── CHANNEL : WEATHER (#☁-weather-data) ────────────────────────────────────
 async def notify_consensus_update(location_name: str, target_date: str, ecmwf_mean: float, 
                                   gfs_mean: float, noaa_mean: float, consensus_mean: float, 
                                   variance: float, triple_lock: bool) -> None:
@@ -115,7 +115,7 @@ async def notify_consensus_update(location_name: str, target_date: str, ecmwf_me
     await _post(_wrap([embed]), target="weather")
     log.info(f"[Discord] Consensus update sent to WEATHER.")
 
-# ─── CHANNEL 3: TERMINAL (#📊-aql-terminal) ──────────────────────────────────
+# ─── CHANNEL : TERMINAL (#📊-aql-terminal) ──────────────────────────────────
 async def notify_daily_pnl_summary(total_trades: int, total_wins: int, win_rate_pct: float, 
                                    total_pnl_usd: float, consecutive_losses: int, circuit_breaker: bool) -> None:
     sign = "+" if total_pnl_usd >= 0 else ""
@@ -138,7 +138,7 @@ async def notify_daily_pnl_summary(total_trades: int, total_wins: int, win_rate_
     await _post(_wrap([embed]), target="terminal")
     log.info("[Discord] Daily PnL summary sent to TERMINAL.")
 
-# ─── CHANNEL 4: ALERTS (#🚨-alerts) ──────────────────────────────────────────
+# ─── CHANNEL : ALERTS (#🚨-alerts) ──────────────────────────────────────────
 async def notify_error(title: str, description: str, is_circuit_breaker: bool = False) -> None:
     header = "⚡ CIRCUIT BREAKER TRIPPED" if is_circuit_breaker else "🔴 ALERT"
     embed = {
