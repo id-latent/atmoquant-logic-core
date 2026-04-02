@@ -1,0 +1,20 @@
+# ── Core Runtime ──────────────────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# ── Async HTTP ────────────────────────────────────────────────────────────────
+httpx==0.27.0
+
+# ── Cryptography / Web3 (lightweight — no full web3.py) ──────────────────────
+eth-account==0.11.0
+eth-keys==0.5.1
+
+# ── Numerics ──────────────────────────────────────────────────────────────────
+scipy==1.13.0
+numpy==1.26.4          # scipy dependency; pinned for Railway build stability
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1   # Local .env support (env vars take priority on Railway)
+
+# ── NOTE: Prophet intentionally excluded — keeps RAM ~80MB ───────────────────
+# Gradient boosting / ML features can be added via scikit-learn if needed later
