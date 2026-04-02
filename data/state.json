@@ -1,0 +1,9 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# state.json = Memori
+# ══════════════════════════════════════════════════════════════════════════════
+
+Isi dengan teks ini: 
+
+{"consecutive_losses": 0, "total_trades": 0, "total_pnl_usd": 0.0, "circuit_breaker_active": false} 
+
+agar bot tidak bingung saat menyala.
