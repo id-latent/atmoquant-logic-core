@@ -1,16 +1,15 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# notifier.py = Kode Notifikasi Discord
+# notifier.py = Kode Notifikasi Discord (Triple-Channel Version)
 # ══════════════════════════════════════════════════════════════════════════════
 
 """
-AQL Notifier — Discord Webhook Integration
+AQL Notifier — Multi-Channel Discord Integration
 Bot identity: "AQL NODE"
 
-Color legend:
-  GREEN  0x2ECC71 — Trade Executed
-  BLUE   0x3498DB — Consensus Update  (RED if Triple-Lock failed)
-  GOLD   0xF1C40F — Daily PnL Summary
-  RED    0xE74C3C — System Error / Circuit Breaker
+Channel Routing:
+  - TERMINAL_WEBHOOK_URL -> Startup, Heartbeat, PnL Summary
+  - WEATHER_WEBHOOK_URL  -> Consensus Updates, Model Forecasts
+  - ALERTS_WEBHOOK_URL   -> Trade Executed, System Errors, Circuit Breakers
 """
 from __future__ import annotations
 
@@ -42,11 +41,19 @@ def _wrap(embeds: list[dict]) -> dict:
     }
 
 
-async def _post(payload: dict) -> bool:
+async def _post(payload: dict, target: str = "terminal") -> bool:
     try:
+        # Penentuan URL berdasarkan target channel
+        if target == "alerts":
+            url = settings.ALERTS_WEBHOOK_URL
+        elif target == "weather":
+            url = settings.WEATHER_WEBHOOK_URL
+        else:
+            url = settings.TERMINAL_WEBHOOK_URL
+
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                settings.DISCORD_WEBHOOK_URL,
+                url,
                 json=payload,
                 timeout=10.0,
             )
@@ -59,7 +66,7 @@ async def _post(payload: dict) -> bool:
         return False
 
 
-# ── GREEN — Trade Executed ────────────────────────────────────────────────────
+# ── GREEN — Trade Executed (Goes to ALERTS) ───────────────────────────────────
 
 async def notify_trade_executed(
     market_name: str,
@@ -93,11 +100,11 @@ async def notify_trade_executed(
         "footer":      {"text": f"AQL NODE  •  {_ts()}"},
         "timestamp":   datetime.now(timezone.utc).isoformat(),
     }
-    await _post(_wrap([embed]))
-    log.info("[Discord] Trade executed.")
+    await _post(_wrap([embed]), target="alerts")
+    log.info("[Discord] Trade executed sent to ALERTS.")
 
 
-# ── BLUE — Consensus Update ───────────────────────────────────────────────────
+# ── BLUE — Consensus Update (Goes to WEATHER) ─────────────────────────────────
 
 async def notify_consensus_update(
     location_name: str,
@@ -138,11 +145,11 @@ async def notify_consensus_update(
         "footer":    {"text": f"AQL NODE  •  {_ts()}"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    await _post(_wrap([embed]))
-    log.info("[Discord] Consensus update sent — lock=%s", triple_lock)
+    await _post(_wrap([embed]), target="weather")
+    log.info("[Discord] Consensus update sent to WEATHER.")
 
 
-# ── GOLD — Daily PnL Summary ──────────────────────────────────────────────────
+# ── GOLD — Daily PnL Summary (Goes to TERMINAL) ───────────────────────────────
 
 async def notify_daily_pnl_summary(
     total_trades: int,
@@ -169,11 +176,11 @@ async def notify_daily_pnl_summary(
         "footer":    {"text": f"AQL NODE  •  {_ts()}"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    await _post(_wrap([embed]))
-    log.info("[Discord] Daily PnL summary sent.")
+    await _post(_wrap([embed]), target="terminal")
+    log.info("[Discord] Daily PnL summary sent to TERMINAL.")
 
 
-# ── RED — Error / Circuit Breaker ─────────────────────────────────────────────
+# ── RED — Error / Circuit Breaker (Goes to ALERTS) ────────────────────────────
 
 async def notify_error(
     title: str,
@@ -188,11 +195,11 @@ async def notify_error(
         "footer":      {"text": f"AQL NODE  •  {_ts()}"},
         "timestamp":   datetime.now(timezone.utc).isoformat(),
     }
-    await _post(_wrap([embed]))
-    log.error("[Discord] Error embed sent: %s", title)
+    await _post(_wrap([embed]), target="alerts")
+    log.error("[Discord] Error embed sent to ALERTS.")
 
 
-# ── Startup Heartbeat ─────────────────────────────────────────────────────────
+# ── Startup Heartbeat (Goes to TERMINAL) ──────────────────────────────────────
 
 async def notify_startup(version: str = "1.0.0") -> None:
     embed = {
@@ -213,5 +220,4 @@ async def notify_startup(version: str = "1.0.0") -> None:
         "footer":    {"text": f"AQL NODE  •  {_ts()}"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    await _post(_wrap([embed]))
-
+    await _post(_wrap([embed]), target="terminal")
