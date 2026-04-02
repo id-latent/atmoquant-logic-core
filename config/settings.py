@@ -4,7 +4,7 @@
 
 """
 AQL Configuration — All credentials read strictly from environment variables.
-Never hardcode secrets.
+Supports Triple-Channel Discord Notification Routing.
 """
 import os
 from dataclasses import dataclass, field
@@ -22,8 +22,12 @@ class AQLSettings:
     # ── Open-Meteo (no key required) ───────────────────────────────────────
     OPENMETEO_BASE: str           = "https://api.open-meteo.com/v1"
 
-    # ── Discord ────────────────────────────────────────────────────────────
-    DISCORD_WEBHOOK_URL: str      = field(default_factory=lambda: os.environ["DISCORD_WEBHOOK_URL"])
+    # ── Discord Multi-Channel ──────────────────────────────────────────────
+    # Menghubungkan variabel Railway ke dalam kode bot
+    TERMINAL_WEBHOOK_URL: str     = field(default_factory=lambda: os.environ["TERMINAL_WEBHOOK_URL"])
+    WEATHER_WEBHOOK_URL: str      = field(default_factory=lambda: os.environ["WEATHER_WEBHOOK_URL"])
+    ALERTS_WEBHOOK_URL: str       = field(default_factory=lambda: os.environ["ALERTS_WEBHOOK_URL"])
+    
     DISCORD_BOT_NAME: str         = "AQL NODE"
     DISCORD_AVATAR_URL: str       = "https://i.imgur.com/AtmoQuantLogo.png"
 
