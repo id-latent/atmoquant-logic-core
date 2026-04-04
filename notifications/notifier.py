@@ -338,23 +338,31 @@ async def notify_error(
     title: str,
     description: str,
     is_circuit_breaker: bool = False,
+    **kwargs, 
 ) -> None:
+  
     if is_circuit_breaker:
         header = "⚡ CIRCUIT BREAKER TRIPPED"
         color  = COLOR_RED
-    elif "⚠️" in title or "Rendah" in title or "Kecil" in title:
+    elif any(word in title for word in ["⚠️", "Rendah", "Kecil"]):
         header = title
         color  = COLOR_ORANGE
     else:
         header = "🔴 SYSTEM ALERT"
         color  = COLOR_RED
 
+    
+    rejections = kwargs.get('consecutive_rejections')
+    rejection_info = f"\n\n**Consecutive Rejections:** `{rejections}x`" if rejections is not None else ""
     embed = {
         "color":       color,
         "title":       header,
-        "description": f"**{title}**\n\n{description[:1800]}",
+        "description": f"**{title}**\n\n{description[:1800]}{rejection_info}",
         "footer":      {"text": f"AQL NODE  •  {_ts()}"},
         "timestamp":   datetime.now(timezone.utc).isoformat(),
     }
+    
     await _post(_wrap([embed]), target="alerts")
     log.error("[Discord] Alert sent: %s", title)
+
+
