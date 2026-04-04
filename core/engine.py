@@ -1,19 +1,13 @@
-# ══════════════════════════════════════════════════════════════════════════════
-# engine.py = Kode Orchestrator
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ==============================================================================
+# engine.py = Master Orchestrator Pipeline
+# ==============================================================================
 """
-AQL Engine — Master Async Orchestrator
-9-step pipeline per market:
-  [1] Location resolution
-  [2] Triple-Lock consensus fetch (ECMWF + GFS + NOAA, concurrent)
-  [3] Discord consensus notification (always)
-  [4] Triple-Lock gate
-  [5] Probability signal + edge
-  [6] Kelly position sizing
-  [7] Circuit breaker guard
-  [8] CLOB order submission
-  [9] Discord trade notification
+AQL Engine — 9-Step Pipeline per Market
+Perbaikan dari versi sebelumnya:
+- Unknown city detector + Discord alert
+- Bankroll health check (warning + halt)
+- Confidence multiplier terintegrasi ke Kelly
+- Circuit breaker membedakan trade loss vs order rejected
 """
 from __future__ import annotations
 
@@ -27,15 +21,19 @@ import httpx
 from config.settings import settings
 from core.consensus import get_triple_lock_consensus, is_decision_phase
 from core.probability import compute_probability_signal
-from core.risk import CircuitBreaker, kelly_position
+from core.risk import CircuitBreaker, LossType, kelly_position
 from market.gamma_client import CLOBExecutor, GammaClient, PolyMarket
 from notifications import notifier
 
 log = logging.getLogger("aql.engine")
 
+# ── Bankroll Safety Thresholds ────────────────────────────────────────────────
+MINIMUM_BANKROLL_HALT    = 15.0   # Stop trading jika di bawah ini
+MINIMUM_BANKROLL_WARNING = 50.0   # Kirim warning jika di bawah ini
+
 # ── Location Registry ─────────────────────────────────────────────────────────
-# city_fragment_lowercase → (latitude, longitude)
-# Add cities as new Polymarket temperature markets emerge.
+# Format: "nama_kota_lowercase": (latitude, longitude)
+# Tambah kota baru di sini jika ada market Polymarket yang tidak terdeteksi
 
 LOCATION_REGISTRY: dict[str, tuple[float, float]] = {
     # United States
@@ -65,7 +63,7 @@ LOCATION_REGISTRY: dict[str, tuple[float, float]] = {
 
 
 def _resolve_location(question: str) -> Optional[tuple[str, float, float]]:
-    """Scan question text for a known city. Returns (name, lat, lon) or None."""
+    """Scan question text untuk kota yang dikenal."""
     q = question.lower()
     for city, (lat, lon) in LOCATION_REGISTRY.items():
         if city in q:
@@ -73,10 +71,78 @@ def _resolve_location(question: str) -> Optional[tuple[str, float, float]]:
     return None
 
 
-# ── AQLEngine ─────────────────────────────────────────────────────────────────
+# ── Bankroll Health Check ─────────────────────────────────────────────────────
+
+async def _check_bankroll_health(bankroll_usd: float) -> bool:
+    """
+    Cek apakah bankroll cukup untuk trading aman.
+    Returns False jika bankroll terlalu kecil dan trading harus dihentikan.
+    """
+    if bankroll_usd < MINIMUM_BANKROLL_HALT:
+        log.critical(
+            "Bankroll $%.2f di bawah minimum $%.2f — trading dihentikan.",
+            bankroll_usd, MINIMUM_BANKROLL_HALT,
+        )
+        await notifier.notify_error(
+            title="🚨 Bankroll Terlalu Kecil — Trading Dihentikan",
+            description=(
+                f"Bankroll saat ini: **${bankroll_usd:.2f}**\n"
+                f"Minimum untuk trading: **${MINIMUM_BANKROLL_HALT:.2f}**\n\n"
+                f"Bot dihentikan otomatis untuk melindungi modal.\n"
+                f"Top up wallet lalu update `BANKROLL_USD` "
+                f"di Railway → Variables."
+            ),
+        )
+        return False
+
+    if bankroll_usd < MINIMUM_BANKROLL_WARNING:
+        log.warning(
+            "Bankroll $%.2f mendekati batas minimum.",
+            bankroll_usd,
+        )
+        await notifier.notify_error(
+            title="⚠️ Bankroll Rendah",
+            description=(
+                f"Bankroll saat ini: **${bankroll_usd:.2f}**\n"
+                f"Disarankan minimum: **${MINIMUM_BANKROLL_WARNING:.2f}**\n\n"
+                f"Bot tetap berjalan tapi pertimbangkan top up segera.\n"
+                f"Kelly sizing sudah berkurang proporsional."
+            ),
+        )
+
+    return True
+
+
+# ── Unknown City Alert ────────────────────────────────────────────────────────
+
+async def _alert_unknown_location(market: PolyMarket) -> None:
+    """
+    Kirim alert ke Discord ketika temperature market ditemukan
+    tapi lokasinya tidak ada di LOCATION_REGISTRY.
+    Berguna agar kamu bisa tambahkan kota baru secara manual.
+    """
+    await notifier.notify_error(
+        title="🗺️ Kota Tidak Dikenal — Market Dilewati",
+        description=(
+            f"**Market temperature ditemukan tapi kota tidak dikenal:**\n"
+            f"```\n{market.question[:200]}\n```\n"
+            f"**Liquidity:** ${market.liquidity_usd:,.0f}\n"
+            f"**Hours to close:** {market.hours_to_close:.1f}h\n"
+            f"**Link:** {market.url}\n\n"
+            f"Tambahkan kota ke `LOCATION_REGISTRY` di `core/engine.py`\n"
+            f"Format: `\"nama kota\": (latitude, longitude)`"
+        ),
+    )
+    log.warning(
+        "[UNKNOWN CITY] %s | $%.0f liq | %.1fh to close",
+        market.question[:70], market.liquidity_usd, market.hours_to_close,
+    )
+
+
+# ── AQL Engine ────────────────────────────────────────────────────────────────
 
 class AQLEngine:
-    VERSION = "1.0.0"
+    VERSION = "1.1.0"
 
     def __init__(self) -> None:
         self.breaker = CircuitBreaker()
@@ -89,23 +155,29 @@ class AQLEngine:
         clob: CLOBExecutor,
         bankroll_usd: float,
     ) -> bool:
-        """Full 9-step pipeline for one candidate market. Returns True on trade."""
+        """Full 9-step pipeline untuk satu market kandidat."""
 
-        # [1] Location
+        # [1] Resolve location
         loc = _resolve_location(market.question)
         if loc is None:
-            log.debug("Unknown location in: %s", market.question[:80])
+            await _alert_unknown_location(market)
             return False
+
         city, lat, lon = loc
         target_date = date.fromisoformat(market.end_date_iso[:10])
 
-        # [2] Consensus
-        consensus = await get_triple_lock_consensus(lat, lon, city, target_date)
+        # Hitung horizon untuk confidence scoring
+        horizon_days = max((target_date - date.today()).days, 1)
+
+        # [2] Triple-Lock consensus dengan retry
+        consensus = await get_triple_lock_consensus(
+            lat, lon, city, target_date
+        )
         if consensus is None:
-            log.warning("Consensus data unavailable for %s.", city)
+            log.warning("Consensus tidak tersedia untuk %s.", city)
             return False
 
-        # [3] Discord update (unconditional)
+        # [3] Discord consensus update (selalu dikirim)
         await notifier.notify_consensus_update(
             location_name=city,
             target_date=str(target_date),
@@ -120,12 +192,12 @@ class AQLEngine:
         # [4] Triple-Lock gate
         if not consensus.triple_lock:
             log.info(
-                "[LOCK FAIL] %s Δ=%.2f°C — skipping %s",
-                city, consensus.inter_model_variance, market.question[:60],
+                "[LOCK FAIL] %s Δ=%.2f°C — skip.",
+                city, consensus.inter_model_variance,
             )
             return False
 
-        # [5] Probability + edge
+        # [5] Probability signal + edge
         signal = compute_probability_signal(
             consensus=consensus,
             market_question=market.question,
@@ -136,27 +208,48 @@ class AQLEngine:
             return False
 
         log.info(
-            "[SIGNAL] %s P(YES)=%.3f market=%.3f edge=%.2f%% → %s",
+            "[SIGNAL] %s P(YES)=%.3f mkt=%.3f edge=%.2f%% → %s",
             city, signal.prob_yes, signal.market_price,
             signal.net_edge * 100, signal.signal,
         )
 
         if signal.signal == "NO_TRADE":
-            log.info("[NO TRADE] Edge %.2f%% below minimum.", signal.net_edge * 100)
+            log.info(
+                "[NO TRADE] Edge %.2f%% di bawah minimum.",
+                signal.net_edge * 100,
+            )
             return False
 
-        # [6] Kelly sizing
-        position = kelly_position(signal, bankroll_usd)
+        # [5b] Confidence multiplier berdasarkan variance + horizon
+        # Semakin kecil variance dan semakin dekat horizon → multiplier tinggi
+        variance_score  = max(0.0, 1.0 - consensus.inter_model_variance)
+        horizon_score   = max(0.3, 1.0 - (horizon_days - 1) * 0.10)
+        confidence_mult = round(0.5 + ((variance_score + horizon_score) / 2 * 0.5), 4)
+        confidence_mult = min(max(confidence_mult, 0.5), 1.0)
+
+        log.info(
+            "[CONFIDENCE] variance_score=%.3f horizon_score=%.3f mult=%.4f",
+            variance_score, horizon_score, confidence_mult,
+        )
+
+        # [6] Kelly sizing dengan confidence multiplier
+        position = kelly_position(
+            signal,
+            bankroll_usd,
+            confidence_multiplier=confidence_mult,
+        )
         if position is None:
             log.info("[NO TRADE] Kelly returned None (non-positive EV).")
             return False
 
         log.info(
-            "[SIZE] %s $%.2f | Kelly=%.5f | EV=$%.2f",
-            position.side, position.size_usd, position.kelly_fraction, position.expected_value_usd,
+            "[SIZE] %s $%.2f | Kelly=%.5f | EV=$%.2f | conf=%.4f",
+            position.side, position.size_usd,
+            position.kelly_fraction, position.expected_value_usd,
+            confidence_mult,
         )
 
-        # [7] Circuit breaker
+        # [7] Circuit breaker check
         if self.breaker.is_open():
             await notifier.notify_error(
                 title="Trade Blocked — Circuit Breaker Active",
@@ -166,13 +259,23 @@ class AQLEngine:
             return False
 
         # [8] Submit order
-        receipt = await clob.submit_order(market, position.side, position.size_usd)
+        receipt = await clob.submit_order(
+            market, position.side, position.size_usd
+        )
+
         if receipt is None:
+            # Order rejected (FOK tidak terisi) — BUKAN trade loss
+            self.breaker.record_loss(
+                pnl_usd=0,
+                loss_type=LossType.ORDER_REJECTED,
+            )
             await notifier.notify_error(
-                title="Order Submission Failed",
+                title="Order Rejected — FOK Tidak Terisi",
                 description=(
                     f"Market: {market.question[:100]}\n"
-                    f"Side: {position.side} | Size: ${position.size_usd:.2f}"
+                    f"Side: {position.side} | "
+                    f"Size: ${position.size_usd:.2f}\n"
+                    f"Kemungkinan: liquiditas tidak cukup saat eksekusi."
                 ),
             )
             return False
@@ -190,18 +293,31 @@ class AQLEngine:
             order_id=receipt.get("orderID"),
         )
 
-        log.info("[TRADE] %s | %s | $%.2f", market.question[:55], position.side, position.size_usd)
+        log.info(
+            "[TRADE] %s | %s | $%.2f",
+            market.question[:55], position.side, position.size_usd,
+        )
         return True
 
-    async def run_scan_cycle(self, bankroll_usd: float = 200.0) -> None:
-        """One full discovery → filter → trade cycle."""
-        log.info("═══ AQL SCAN  %s ═══", datetime.now(timezone.utc).isoformat())
+    # ── Scan Cycle ────────────────────────────────────────────────────────────
 
+    async def run_scan_cycle(self, bankroll_usd: float = 200.0) -> None:
+        """Satu full discovery → filter → trade cycle."""
+        log.info(
+            "═══ AQL SCAN %s ═══",
+            datetime.now(timezone.utc).isoformat(),
+        )
+
+        # Bankroll health check
+        if not await _check_bankroll_health(bankroll_usd):
+            return
+
+        # Circuit breaker check
         if self.breaker.is_open():
-            log.critical("Circuit breaker open — aborting scan.")
+            log.critical("Circuit breaker open — scan dibatalkan.")
             await notifier.notify_error(
-                title="Scan Aborted",
-                description="Circuit breaker is open. Manual reset required.",
+                title="Scan Dibatalkan — Circuit Breaker Active",
+                description="Reset via POST /admin/reset-breaker.",
                 is_circuit_breaker=True,
             )
             return
@@ -218,35 +334,45 @@ class AQLEngine:
             )
 
             if not markets:
-                log.info("No qualifying markets found this cycle.")
+                log.info("Tidak ada market yang memenuhi syarat cycle ini.")
                 return
 
-            sem = asyncio.Semaphore(3)   # Max 3 concurrent market pipelines
+            # Max 3 market diproses bersamaan
+            sem = asyncio.Semaphore(3)
 
             async def _safe(m: PolyMarket) -> bool:
                 async with sem:
                     try:
-                        return await self._process_market(http, m, clob, bankroll_usd)
+                        return await self._process_market(
+                            http, m, clob, bankroll_usd
+                        )
                     except Exception as e:
-                        log.error("Pipeline error [%s]: %s", m.market_id, e, exc_info=True)
+                        log.error(
+                            "Pipeline error [%s]: %s",
+                            m.market_id, e, exc_info=True,
+                        )
                         await notifier.notify_error(
                             title="Unhandled Pipeline Error",
-                            description=f"{m.question[:100]}\n{str(e)[:400]}",
+                            description=(
+                                f"{m.question[:100]}\n{str(e)[:400]}"
+                            ),
                         )
                         return False
 
             results = await asyncio.gather(*[_safe(m) for m in markets])
             log.info(
-                "Cycle done. Placed: %d / %d candidates.",
+                "Cycle selesai. Trade: %d / %d kandidat.",
                 sum(results), len(markets),
             )
 
+    # ── Forever Loop ──────────────────────────────────────────────────────────
+
     async def run_forever(self, bankroll_usd: float = 200.0) -> None:
         """
-        Infinite monitoring loop with:
-          • Daily PnL summary at UTC midnight
-          • POLL_INTERVAL_SECONDS between cycles
-          • Crash recovery with Discord error notification
+        Infinite monitoring loop:
+        - Daily PnL summary setiap tengah malam UTC
+        - Scan cycle setiap POLL_INTERVAL_SECONDS
+        - Auto-recovery dari crash dengan Discord notification
         """
         await notifier.notify_startup(self.VERSION)
         last_summary: Optional[date] = None
@@ -255,6 +381,7 @@ class AQLEngine:
             try:
                 now = datetime.now(timezone.utc)
 
+                # Daily PnL summary di tengah malam UTC
                 if last_summary != now.date():
                     await notifier.notify_daily_pnl_summary(
                         **self.breaker.get_daily_pnl_summary()
@@ -264,7 +391,7 @@ class AQLEngine:
                 await self.run_scan_cycle(bankroll_usd=bankroll_usd)
 
             except KeyboardInterrupt:
-                log.info("Shutdown signal — exiting.")
+                log.info("Shutdown signal — keluar.")
                 break
             except Exception as e:
                 log.critical("Main loop error: %s", e, exc_info=True)
