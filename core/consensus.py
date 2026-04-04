@@ -1,13 +1,12 @@
-# ══════════════════════════════════════════════════════════════════════════════
-# consensus.py = Kode Triple-Lock
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ==============================================================================
+# consensus.py = Triple-Lock Engine + Retry Logic
+# ==============================================================================
 """
 AQL Consensus Engine — Triple-Lock Logic
 Fetches ECMWF, GFS, and NOAA forecasts from Open-Meteo concurrently.
-Returns a ConsensusResult only when all three models agree within
-TRIPLE_LOCK_VARIANCE_C (default 1.0°C). Strict None propagation on
-any data failure — never silently degrades to a 2-model consensus.
+Includes exponential backoff retry untuk setiap model.
+Returns ConsensusResult only when all three models agree within
+TRIPLE_LOCK_VARIANCE_C (default 1.0°C).
 """
 from __future__ import annotations
 
@@ -23,8 +22,11 @@ from config.settings import settings
 
 log = logging.getLogger("aql.consensus")
 
-# ── Model → Open-Meteo endpoint + parameter mapping ──────────────────────────
+# ── Retry Configuration ───────────────────────────────────────────────────────
+MAX_RETRIES    = 3
+BASE_DELAY_SEC = 1.5
 
+# ── Model → Open-Meteo endpoint + parameter mapping ──────────────────────────
 MODEL_ENDPOINTS: dict[str, str] = {
     "ECMWF": f"{settings.OPENMETEO_BASE}/ecmwf",
     "GFS":   f"{settings.OPENMETEO_BASE}/gfs",
@@ -52,7 +54,7 @@ class ModelForecast:
 
 @dataclass
 class ConsensusResult:
-    """Emitted regardless of triple_lock status — caller checks triple_lock field."""
+    """Emitted regardless of triple_lock status — caller checks triple_lock."""
     target_date: date
     location_name: str
     latitude: float
@@ -62,12 +64,12 @@ class ConsensusResult:
     gfs: ModelForecast
     noaa: ModelForecast
 
-    consensus_t_max: float       # Arithmetic mean across all 3 models
+    consensus_t_max: float
     consensus_t_min: float
     consensus_t_mean: float
-    inter_model_variance: float  # max(t_means) - min(t_means)
+    inter_model_variance: float
 
-    triple_lock: bool            # True iff variance ≤ TRIPLE_LOCK_VARIANCE_C
+    triple_lock: bool
     timestamp: datetime
 
     @property
@@ -79,19 +81,16 @@ class ConsensusResult:
         )
 
 
-# ── Single-Model Fetcher ──────────────────────────────────────────────────────
+# ── Single Attempt Fetcher ────────────────────────────────────────────────────
 
-async def _fetch_model_forecast(
+async def _fetch_once(
     client: httpx.AsyncClient,
     model_name: str,
     latitude: float,
     longitude: float,
     target_date: date,
 ) -> Optional[ModelForecast]:
-    """
-    Async fetch of daily temperature forecast for one NWP model.
-    Returns None on any HTTP or data error — never raises.
-    """
+    """Satu attempt fetch tanpa retry. Dipanggil oleh _fetch_with_retry."""
     endpoint    = MODEL_ENDPOINTS[model_name]
     extra_params = MODEL_PARAMS[model_name]
 
@@ -106,43 +105,104 @@ async def _fetch_model_forecast(
         **extra_params,
     }
 
-    try:
-        resp = await client.get(endpoint, params=params, timeout=15.0)
-        resp.raise_for_status()
-        data = resp.json()
+    resp = await client.get(endpoint, params=params, timeout=15.0)
+    resp.raise_for_status()
+    data = resp.json()
 
-        daily = data.get("daily", {})
-        if not daily.get("time"):
-            log.warning("[%s] Empty daily block for %s", model_name, target_date)
-            return None
+    daily = data.get("daily", {})
+    if not daily.get("time"):
+        log.warning("[%s] Empty daily block untuk %s", model_name, target_date)
+        return None
 
-        t_max  = daily["temperature_2m_max"][0]
-        t_min  = daily["temperature_2m_min"][0]
-        t_mean = daily["temperature_2m_mean"][0]
+    t_max  = daily["temperature_2m_max"][0]
+    t_min  = daily["temperature_2m_min"][0]
+    t_mean = daily["temperature_2m_mean"][0]
 
-        if any(v is None for v in [t_max, t_min, t_mean]):
-            log.warning("[%s] Null temperature values for %s", model_name, target_date)
-            return None
+    if any(v is None for v in [t_max, t_min, t_mean]):
+        log.warning("[%s] Null values untuk %s", model_name, target_date)
+        return None
 
-        return ModelForecast(
-            model=model_name,
-            target_date=target_date,
-            t_max_c=float(t_max),
-            t_min_c=float(t_min),
-            t_mean_c=float(t_mean),
-            fetched_at=datetime.now(timezone.utc),
-        )
+    return ModelForecast(
+        model=model_name,
+        target_date=target_date,
+        t_max_c=float(t_max),
+        t_min_c=float(t_min),
+        t_mean_c=float(t_mean),
+        fetched_at=datetime.now(timezone.utc),
+    )
 
-    except httpx.HTTPStatusError as e:
-        log.error(
-            "[%s] HTTP %d from Open-Meteo: %s",
-            model_name, e.response.status_code, e.response.text[:200],
-        )
-    except httpx.TimeoutException:
-        log.error("[%s] Request timed out for %s", model_name, target_date)
-    except Exception as e:
-        log.error("[%s] Unexpected error: %s", model_name, str(e))
 
+# ── Retry Wrapper ─────────────────────────────────────────────────────────────
+
+async def _fetch_with_retry(
+    client: httpx.AsyncClient,
+    model_name: str,
+    latitude: float,
+    longitude: float,
+    target_date: date,
+) -> Optional[ModelForecast]:
+    """
+    Fetch dengan exponential backoff retry.
+    Attempt 1 : langsung
+    Attempt 2 : tunggu 1.5s
+    Attempt 3 : tunggu 3.0s
+    Gagal semua → return None
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            result = await _fetch_once(
+                client, model_name, latitude, longitude, target_date
+            )
+            if result is not None:
+                if attempt > 1:
+                    log.info(
+                        "[%s] Berhasil di attempt ke-%d",
+                        model_name, attempt
+                    )
+                return result
+
+        except httpx.TimeoutException:
+            log.warning(
+                "[%s] Timeout attempt %d/%d",
+                model_name, attempt, MAX_RETRIES
+            )
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            # Rate limit → tunggu lebih lama
+            if status == 429:
+                wait = BASE_DELAY_SEC * (2 ** attempt) + 5.0
+                log.warning(
+                    "[%s] Rate limited (429). Tunggu %.1fs sebelum retry.",
+                    model_name, wait
+                )
+                await asyncio.sleep(wait)
+                continue
+            # Server error (500, 503) → retry normal
+            log.warning(
+                "[%s] HTTP %d attempt %d/%d",
+                model_name, status, attempt, MAX_RETRIES
+            )
+
+        except Exception as e:
+            log.error(
+                "[%s] Unexpected error attempt %d/%d: %s",
+                model_name, attempt, MAX_RETRIES, str(e)
+            )
+
+        # Tunggu sebelum retry berikutnya (kecuali attempt terakhir)
+        if attempt < MAX_RETRIES:
+            delay = BASE_DELAY_SEC * (2 ** (attempt - 1))
+            log.debug(
+                "[%s] Retry dalam %.1fs... (attempt %d/%d)",
+                model_name, delay, attempt + 1, MAX_RETRIES
+            )
+            await asyncio.sleep(delay)
+
+    log.error(
+        "[%s] Semua %d attempt gagal untuk %s",
+        model_name, MAX_RETRIES, target_date
+    )
     return None
 
 
@@ -155,19 +215,20 @@ async def get_triple_lock_consensus(
     target_date: date,
 ) -> Optional[ConsensusResult]:
     """
-    Concurrently fetch ECMWF, GFS, NOAA and evaluate Triple-Lock condition.
-    Returns None if ANY model fails — system requires all three for signal integrity.
+    Concurrent fetch ECMWF + GFS + NOAA dengan retry.
+    Returns None jika ANY model gagal setelah semua retry habis.
+    Tidak pernah degradasi ke 2-model consensus.
     """
     async with httpx.AsyncClient() as client:
         ecmwf, gfs, noaa = await asyncio.gather(
-            _fetch_model_forecast(client, "ECMWF", latitude, longitude, target_date),
-            _fetch_model_forecast(client, "GFS",   latitude, longitude, target_date),
-            _fetch_model_forecast(client, "NOAA",  latitude, longitude, target_date),
+            _fetch_with_retry(client, "ECMWF", latitude, longitude, target_date),
+            _fetch_with_retry(client, "GFS",   latitude, longitude, target_date),
+            _fetch_with_retry(client, "NOAA",  latitude, longitude, target_date),
         )
 
     if any(m is None for m in [ecmwf, gfs, noaa]):
         log.error(
-            "Consensus aborted — incomplete model data. "
+            "Consensus aborted — data tidak lengkap. "
             "ECMWF=%s | GFS=%s | NOAA=%s",
             ecmwf is not None, gfs is not None, noaa is not None,
         )
@@ -207,8 +268,8 @@ async def get_triple_lock_consensus(
 
 def is_decision_phase(now: Optional[datetime] = None) -> bool:
     """
-    Returns True if current UTC hour falls within ±2h of a 00z or 12z model run.
-    Fresh model data is typically available ~2–4h after nominal run time.
+    Returns True jika UTC hour saat ini dalam window ±2h
+    dari 00z atau 12z model run.
     """
     now       = now or datetime.now(timezone.utc)
     tolerance = 2
@@ -218,4 +279,3 @@ def is_decision_phase(now: Optional[datetime] = None) -> bool:
         if diff <= tolerance or diff >= (24 - tolerance):
             return True
     return False
-
