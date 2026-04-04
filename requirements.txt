@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# Daftar library Python (FastAPI, Scipy, httpx, dll)
+# Daftar library Python (FastAPI, Scipy, httpx, Brotli, dll)
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Core Runtime ──────────────────────────────────────────────────────────────
@@ -8,6 +8,7 @@ uvicorn[standard]==0.29.0
 
 # ── Async HTTP ────────────────────────────────────────────────────────────────
 httpx==0.27.0
+brotli==1.1.0
 
 # ── Cryptography / Web3 (lightweight — no full web3.py) ──────────────────────
 eth-account==0.11.0
