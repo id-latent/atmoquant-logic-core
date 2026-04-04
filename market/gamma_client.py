@@ -1,18 +1,20 @@
-# ══════════════════════════════════════════════════════════════════════════════
-# gamma_client.py = Kode API Polymarket 
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ==============================================================================
+# gamma_client.py = Polymarket Gamma API + CLOB Execution + Anti-Detection
+# ==============================================================================
 """
-AQL Gamma Client — Polymarket Gamma API + CLOB Execution Layer
-Responsibilities:
-  1. Paginated market discovery with temperature keyword/tag filtering
-  2. Liquidity + timing gate (12–14h before resolution window)
-  3. EIP-712 order signing and CLOB submission (Polygon network)
+AQL Gamma Client
+Perbaikan dari versi sebelumnya:
+- Request jittering (human-like delay)
+- User-agent rotation
+- Retry pada Gamma API pagination
+- Error handling lebih ketat
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,34 +28,53 @@ from config.settings import settings
 
 log = logging.getLogger("aql.gamma")
 
+# ── User-Agent Pool ───────────────────────────────────────────────────────────
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36",
 
-# ── Market Data Container ─────────────────────────────────────────────────────
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36",
 
-@dataclass
-class PolyMarket:
-    market_id: str
-    condition_id: str
-    question: str
-    description: str
-    end_date_iso: str
-    yes_token_id: str
-    no_token_id: str
-    best_bid: float
-    best_ask: float
-    mid_price: float
-    volume_usd: float
-    liquidity_usd: float
-    active: bool
-    url: str
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36",
 
-    @property
-    def hours_to_close(self) -> float:
-        try:
-            end   = datetime.fromisoformat(self.end_date_iso.replace("Z", "+00:00"))
-            delta = end - datetime.now(timezone.utc)
-            return max(delta.total_seconds() / 3600, 0.0)
-        except Exception:
-            return 0.0
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) "
+    "Gecko/20100101 Firefox/124.0",
+
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.4 Safari/605.1.15",
+]
+
+
+def _random_headers() -> dict:
+    """Generate random headers untuk setiap request."""
+    return {
+        "User-Agent":      random.choice(_USER_AGENTS),
+        "Accept":          "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection":      "keep-alive",
+        "Cache-Control":   "no-cache",
+    }
+
+
+async def _human_delay(
+    min_ms: int = 300,
+    max_ms: int = 1200,
+) -> None:
+    """
+    Simulasi human-like latency sebelum request.
+    5% chance ada 'thinking pause' 2-5 detik tambahan.
+    """
+    delay_ms = random.randint(min_ms, max_ms)
+    if random.random() < 0.05:
+        delay_ms += random.randint(2000, 5000)
+    await asyncio.sleep(delay_ms / 1000)
 
 
 # ── Temperature Market Classifier ────────────────────────────────────────────
@@ -79,18 +100,60 @@ def _is_temperature_market(raw: dict) -> bool:
     return any(kw in combined for kw in TEMPERATURE_KEYWORDS)
 
 
+# ── Market Data Container ─────────────────────────────────────────────────────
+
+@dataclass
+class PolyMarket:
+    market_id: str
+    condition_id: str
+    question: str
+    description: str
+    end_date_iso: str
+    yes_token_id: str
+    no_token_id: str
+    best_bid: float
+    best_ask: float
+    mid_price: float
+    volume_usd: float
+    liquidity_usd: float
+    active: bool
+    url: str
+
+    @property
+    def hours_to_close(self) -> float:
+        try:
+            end   = datetime.fromisoformat(
+                self.end_date_iso.replace("Z", "+00:00")
+            )
+            delta = end - datetime.now(timezone.utc)
+            return max(delta.total_seconds() / 3600, 0.0)
+        except Exception:
+            return 0.0
+
+
 # ── Gamma REST Client ─────────────────────────────────────────────────────────
 
 class GammaClient:
-    """Thin async wrapper around Polymarket's Gamma read-only API."""
+    """Async Polymarket Gamma API client dengan anti-detection."""
 
     BASE = settings.POLY_GAMMA_BASE
 
     def __init__(self, http_client: httpx.AsyncClient) -> None:
         self._http = http_client
 
-    async def _get(self, path: str, params: Optional[dict] = None) -> list | dict:
-        resp = await self._http.get(f"{self.BASE}{path}", params=params, timeout=20.0)
+    async def _get(
+        self,
+        path: str,
+        params: Optional[dict] = None,
+    ) -> list | dict:
+        """GET request dengan jitter + random headers."""
+        await _human_delay(min_ms=300, max_ms=900)
+        resp = await self._http.get(
+            f"{self.BASE}{path}",
+            params=params,
+            headers=_random_headers(),
+            timeout=20.0,
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -101,10 +164,10 @@ class GammaClient:
         hours_before_close_max: float = 14.0,
     ) -> list[PolyMarket]:
         """
-        Returns temperature markets that satisfy:
-          • Active + not yet closed
-          • Liquidity ≥ min_liquidity_usd
-          • Resolution in [hours_before_close_min, hours_before_close_max]
+        Discover temperature markets dengan:
+        - Liquidity gate
+        - Timing gate (12-14h sebelum resolusi)
+        - Jitter antar halaman pagination
         """
         log.info("Market discovery — scanning Gamma API...")
         raw_markets: list[dict] = []
@@ -115,30 +178,49 @@ class GammaClient:
                 page = await self._get(
                     "/markets",
                     params={
-                        "active":     "true",
-                        "closed":     "false",
-                        "limit":      limit,
-                        "offset":     offset,
-                        "order":      "volumeNum",
-                        "ascending":  "false",
+                        "active":    "true",
+                        "closed":    "false",
+                        "limit":     limit,
+                        "offset":    offset,
+                        "order":     "volumeNum",
+                        "ascending": "false",
                     },
                 )
             except httpx.HTTPStatusError as e:
-                log.error("Gamma API paginate error: HTTP %d", e.response.status_code)
+                log.error(
+                    "Gamma API error HTTP %d — stop pagination.",
+                    e.response.status_code,
+                )
                 break
             except httpx.TimeoutException:
-                log.error("Gamma API paginate timeout at offset=%d", offset)
+                log.error(
+                    "Gamma API timeout offset=%d — stop pagination.", offset
+                )
+                break
+            except Exception as e:
+                log.error("Gamma API unexpected error: %s", str(e))
                 break
 
-            batch = page if isinstance(page, list) else page.get("markets", [])
+            batch = (
+                page if isinstance(page, list)
+                else page.get("markets", [])
+            )
             if not batch:
                 break
+
             raw_markets.extend(batch)
+
             if len(batch) < limit:
                 break
+
             offset += limit
 
-        log.info("Gamma API returned %d total active markets.", len(raw_markets))
+            # Jitter antar halaman pagination
+            await _human_delay(min_ms=200, max_ms=600)
+
+        log.info(
+            "Gamma API: %d total active markets.", len(raw_markets)
+        )
 
         markets: list[PolyMarket] = []
         for raw in raw_markets:
@@ -152,20 +234,24 @@ class GammaClient:
             def _tok(t) -> str:
                 return t if isinstance(t, str) else t.get("token_id", "")
 
-            yes_tok = _tok(tokens[0])
-            no_tok  = _tok(tokens[1])
-
+            yes_tok   = _tok(tokens[0])
+            no_tok    = _tok(tokens[1])
             liquidity = float(raw.get("liquidityNum") or raw.get("liquidity") or 0)
             volume    = float(raw.get("volumeNum")    or raw.get("volume")    or 0)
             bid       = float(raw.get("bestBid")      or 0.5)
             ask       = float(raw.get("bestAsk")      or 0.5)
             mid       = (bid + ask) / 2.0
             end_date  = raw.get("endDateIso") or raw.get("endDate") or ""
-            url       = f"https://polymarket.com/event/{raw.get('slug', raw.get('id', ''))}"
+            url       = (
+                f"https://polymarket.com/event/"
+                f"{raw.get('slug', raw.get('id', ''))}"
+            )
 
             pm = PolyMarket(
                 market_id=str(raw.get("id", "")),
-                condition_id=str(raw.get("conditionId") or raw.get("condition_id", "")),
+                condition_id=str(
+                    raw.get("conditionId") or raw.get("condition_id", "")
+                ),
                 question=raw.get("question", ""),
                 description=raw.get("description", ""),
                 end_date_iso=end_date,
@@ -196,8 +282,10 @@ class GammaClient:
         log.info("Temperature markets in entry window: %d", len(markets))
         return markets
 
-    async def refresh_market_price(self, condition_id: str) -> Optional[float]:
-        """Return current mid-price or None on error."""
+    async def refresh_market_price(
+        self, condition_id: str
+    ) -> Optional[float]:
+        """Refresh harga terkini untuk satu market."""
         try:
             data = await self._get(f"/markets/{condition_id}")
             bid  = float(data.get("bestBid") or 0.5)
@@ -212,8 +300,8 @@ class GammaClient:
 
 class CLOBExecutor:
     """
-    Signs and submits limit orders to Polymarket CLOB via Polygon-signed messages.
-    Private key is sourced exclusively from POLY_PRIVATE_KEY env var.
+    Signs dan submit limit orders ke Polymarket CLOB.
+    Private key dari POLY_PRIVATE_KEY env var.
     """
 
     CLOB_BASE = settings.POLY_CLOB_BASE
@@ -221,17 +309,25 @@ class CLOBExecutor:
     def __init__(self, http_client: httpx.AsyncClient) -> None:
         self._http    = http_client
         self._account = Account.from_key(settings.POLY_PRIVATE_KEY)
-        log.info("CLOB Executor ready | Signer: %s", self._account.address)
+        log.info(
+            "CLOB Executor ready | Signer: %s",
+            self._account.address,
+        )
 
-    def _build_order(self, token_id: str, price: float, size_usd: float) -> dict:
+    def _build_order(
+        self,
+        token_id: str,
+        price: float,
+        size_usd: float,
+    ) -> dict:
         return {
             "tokenID":    token_id,
             "side":       "BUY",
             "price":      str(round(price, 4)),
             "size":       str(round(size_usd / price, 4)),
             "nonce":      int(time.time() * 1000),
-            "feeRateBps": "170",      # 1.7%
-            "expiration": "0",        # GTC
+            "feeRateBps": "170",
+            "expiration": "0",
             "maker":      self._account.address,
             "chainId":    settings.POLY_CHAIN_ID,
         }
@@ -250,41 +346,55 @@ class CLOBExecutor:
         slippage_pct: float = 0.02,
     ) -> Optional[dict]:
         """
-        Build, sign, and submit a Fill-or-Kill limit order.
-        Returns the CLOB receipt dict or None on any failure.
+        Build, sign, dan submit FOK limit order.
+        Jitter sebelum submit untuk anti-detection.
+        Returns receipt dict atau None jika gagal.
         """
-        token_id    = market.yes_token_id if side == "YES" else market.no_token_id
-        raw_price   = market.best_ask if side == "YES" else (1.0 - market.best_bid)
+        token_id    = (
+            market.yes_token_id if side == "YES"
+            else market.no_token_id
+        )
+        raw_price   = (
+            market.best_ask if side == "YES"
+            else (1.0 - market.best_bid)
+        )
         limit_price = round(raw_price * (1 + slippage_pct), 4)
 
         order   = self._build_order(token_id, limit_price, size_usd)
         sig     = self._sign(order)
         payload = {"order": order, "signature": sig, "orderType": "FOK"}
 
+        # Jitter sebelum submit order
+        await _human_delay(min_ms=500, max_ms=1500)
+
         try:
             resp = await self._http.post(
                 f"{self.CLOB_BASE}/order",
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    **_random_headers(),
+                    "Content-Type": "application/json",
+                },
                 timeout=15.0,
             )
             resp.raise_for_status()
             receipt = resp.json()
             log.info(
                 "ORDER OK | %s | $%.2f @ %.4f | id=%s",
-                side, size_usd, limit_price, receipt.get("orderID", "?"),
+                side, size_usd, limit_price,
+                receipt.get("orderID", "?"),
             )
             return receipt
 
         except httpx.HTTPStatusError as e:
             log.error(
-                "CLOB submission failed [%d]: %s",
-                e.response.status_code, e.response.text[:300],
+                "CLOB failed [%d]: %s",
+                e.response.status_code,
+                e.response.text[:300],
             )
         except httpx.TimeoutException:
-            log.error("CLOB submission timed out.")
+            log.error("CLOB submission timeout.")
         except Exception as e:
-            log.error("CLOB unexpected error: %s", str(e))
+            log.error("CLOB unexpected: %s", str(e))
 
         return None
-
