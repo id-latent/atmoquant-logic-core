@@ -28,11 +28,11 @@ class AQLSettings:
     WEATHER_WEBHOOK_URL: str       = field(
         default_factory=lambda: os.environ["WEATHER_WEBHOOK_URL"]
     )
-    ALERTS_WEBHOOK_URL: str        = field(
-        default_factory=lambda: os.environ["ALERTS_WEBHOOK_URL"]
-    )
     TRADE_WEBHOOK_URL: str         = field(
         default_factory=lambda: os.environ["TRADE_WEBHOOK_URL"]
+    )
+    ALERTS_WEBHOOK_URL: str        = field(
+        default_factory=lambda: os.environ["ALERTS_WEBHOOK_URL"]
     )
     DISCORD_BOT_NAME: str          = "AQL NODE"
     DISCORD_AVATAR_URL: str        = "https://i.imgur.com/AtmoQuantLogo.png"
