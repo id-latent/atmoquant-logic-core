@@ -1,25 +1,26 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # Daftar library Python (FastAPI, Scipy, httpx, Brotli, dll)
+# Target RAM: ~120MB
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Core Runtime ──────────────────────────────────────────────────────────────
+# ── Core Runtime ───────────────────────────────────────────────────────────────
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 
-# ── Async HTTP ────────────────────────────────────────────────────────────────
+# ── Async HTTP ─────────────────────────────────────────────────────────────────
 httpx==0.27.0
 brotli==1.1.0
 
-# ── Cryptography / Web3 (lightweight — no full web3.py) ──────────────────────
+# ── Cryptography / Web3 ────────────────────────────────────────────────────────
 eth-account==0.11.0
 eth-keys==0.5.1
 
-# ── Numerics ──────────────────────────────────────────────────────────────────
+# ── Numerics ───────────────────────────────────────────────────────────────────
 scipy==1.13.0
-numpy==1.26.4          # scipy dependency; pinned for Railway build stability
+numpy==1.26.4
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
-python-dotenv==1.0.1   # Local .env support (env vars take priority on Railway)
+# ── Timezone Support ───────────────────────────────────────────────────────────
+pytz==2024.1
 
-# ── NOTE: Prophet intentionally excluded — keeps RAM ~80MB ───────────────────
-# Gradient boosting / ML features can be added via scikit-learn if needed later
+# ── Utilities ──────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
