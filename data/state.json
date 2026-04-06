@@ -1,9 +1,19 @@
-# ══════════════════════════════════════════════════════════════════════════════
-# state.json = Memori
-# ══════════════════════════════════════════════════════════════════════════════
-
-Isi dengan teks ini: 
-
-{"consecutive_losses": 0, "total_trades": 0, "total_pnl_usd": 0.0, "circuit_breaker_active": false} 
-
-agar bot tidak bingung saat menyala.
+{
+  "consecutive_losses": 0,
+  "consecutive_rejections": 0,
+  "total_trades": 0,
+  "total_wins": 0,
+  "total_rejections": 0,
+  "total_pnl_usd": 0.0,
+  "circuit_breaker_active": false,
+  "circuit_breaker_since": null,
+  "daily_stats": {},
+  "week_start": "",
+  "week_pnl": 0.0,
+  "week_trades": 0,
+  "week_wins": 0,
+  "last_updated": "",
+  "open_positions": {},
+  "market_cache": {},
+  "scan_cycle": 0
+}
