@@ -1,13 +1,27 @@
 # ==============================================================================
-# engine.py = Master Orchestrator Pipeline
+# engine.py — Master Orchestrator v2.0.0
 # ==============================================================================
 """
-AQL Engine — 9-Step Pipeline per Market
-Perbaikan dari versi sebelumnya:
-- Unknown city detector + Discord alert
-- Bankroll health check (warning + halt)
-- Confidence multiplier terintegrasi ke Kelly
-- Circuit breaker membedakan trade loss vs order rejected
+AQL Engine Unified Pipeline
+
+Pipeline per market:
+  [1]  Bankroll health check
+  [2]  Unified discovery (events + binary markets)
+  [3]  Update prices + check exit conditions (SL/TP)
+  [4]  Golden Hour gate
+  [5]  Quad-Lock consensus (ECMWF+GFS+NOAA+ICON)
+  [6]  Market cache check
+  [7]  Discord consensus notification
+  [8]  Triple-Lock gate
+  [9]  Probability evaluation (multi-outcome atau binary)
+  [10] Volume signal analysis
+  [11] Confidence scoring
+  [12] Kelly position sizing (all multipliers)
+  [13] Position tracking check (max 2 per city + no double entry)
+  [14] Circuit breaker check
+  [15] CLOB order submission
+  [16] Position tracking add
+  [17] Discord trade notification
 """
 from __future__ import annotations
 
@@ -19,304 +33,412 @@ from typing import Optional
 import httpx
 
 from config.settings import settings
-from core.consensus import get_triple_lock_consensus, is_decision_phase
-from core.probability import compute_probability_signal
+from core.consensus import get_triple_lock_consensus
+from core.exit_strategy import ExitStrategy
+from core.location_registry import (
+    CityInfo,
+    GoldenHourStatus,
+    check_golden_hour,
+    golden_hour_multiplier,
+)
+from core.market_cache import MarketCache
+from core.position_tracker import PositionTracker, build_position
+from core.probability import (
+    OutcomeCandidate,
+    ProbabilitySignal,
+    evaluate_binary,
+    evaluate_multi_outcome,
+)
 from core.risk import CircuitBreaker, LossType, kelly_position
-from market.gamma_client import CLOBExecutor, GammaClient, PolyMarket
+from core.volume_analyzer import analyze_volume, calculate_avg_volume
+from market.gamma_client import CLOBExecutor, GammaClient, TemperatureMarket
 from notifications import notifier
 
 log = logging.getLogger("aql.engine")
 
-# ── Bankroll Safety Thresholds ────────────────────────────────────────────────
-MINIMUM_BANKROLL_HALT    = 15.0   # Stop trading jika di bawah ini
-MINIMUM_BANKROLL_WARNING = 50.0   # Kirim warning jika di bawah ini
-
-# ── Location Registry ─────────────────────────────────────────────────────────
-# Format: "nama_kota_lowercase": (latitude, longitude)
-# Tambah kota baru di sini jika ada market Polymarket yang tidak terdeteksi
-
-LOCATION_REGISTRY: dict[str, tuple[float, float]] = {
-    # United States
-    "new york":    (40.7128, -74.0060),
-    "nyc":         (40.7128, -74.0060),
-    "chicago":     (41.8781, -87.6298),
-    "los angeles": (34.0522, -118.2437),
-    "miami":       (25.7617, -80.1918),
-    "houston":     (29.7604, -95.3698),
-    "dallas":      (32.7767, -96.7970),
-    "phoenix":     (33.4484, -112.0740),
-    "seattle":     (47.6062, -122.3321),
-    "denver":      (39.7392, -104.9903),
-    "atlanta":     (33.7490, -84.3880),
-    "las vegas":   (36.1699, -115.1398),
-    "boston":      (42.3601, -71.0589),
-    "minneapolis": (44.9778, -93.2650),
-    # Europe
-    "london":      (51.5074,  -0.1278),
-    "paris":       (48.8566,   2.3522),
-    "berlin":      (52.5200,  13.4050),
-    "madrid":      (40.4168,  -3.7038),
-    "rome":        (41.9028,  12.4964),
-    "amsterdam":   (52.3676,   4.9041),
-    "zurich":      (47.3769,   8.5417),
-}
-
-
-def _resolve_location(question: str) -> Optional[tuple[str, float, float]]:
-    """Scan question text untuk kota yang dikenal."""
-    q = question.lower()
-    for city, (lat, lon) in LOCATION_REGISTRY.items():
-        if city in q:
-            return city.title(), lat, lon
-    return None
-
-
-# ── Bankroll Health Check ─────────────────────────────────────────────────────
-
-async def _check_bankroll_health(bankroll_usd: float) -> bool:
-    """
-    Cek apakah bankroll cukup untuk trading aman.
-    Returns False jika bankroll terlalu kecil dan trading harus dihentikan.
-    """
-    if bankroll_usd < MINIMUM_BANKROLL_HALT:
-        log.critical(
-            "Bankroll $%.2f di bawah minimum $%.2f — trading dihentikan.",
-            bankroll_usd, MINIMUM_BANKROLL_HALT,
-        )
-        await notifier.notify_error(
-            title="🚨 Bankroll Terlalu Kecil — Trading Dihentikan",
-            description=(
-                f"Bankroll saat ini: **${bankroll_usd:.2f}**\n"
-                f"Minimum untuk trading: **${MINIMUM_BANKROLL_HALT:.2f}**\n\n"
-                f"Bot dihentikan otomatis untuk melindungi modal.\n"
-                f"Top up wallet lalu update `BANKROLL_USD` "
-                f"di Railway → Variables."
-            ),
-        )
-        return False
-
-    if bankroll_usd < MINIMUM_BANKROLL_WARNING:
-        log.warning(
-            "Bankroll $%.2f mendekati batas minimum.",
-            bankroll_usd,
-        )
-        await notifier.notify_error(
-            title="⚠️ Bankroll Rendah",
-            description=(
-                f"Bankroll saat ini: **${bankroll_usd:.2f}**\n"
-                f"Disarankan minimum: **${MINIMUM_BANKROLL_WARNING:.2f}**\n\n"
-                f"Bot tetap berjalan tapi pertimbangkan top up segera.\n"
-                f"Kelly sizing sudah berkurang proporsional."
-            ),
-        )
-
-    return True
-
-
-# ── Unknown City Alert ────────────────────────────────────────────────────────
-
-async def _alert_unknown_location(market: PolyMarket) -> None:
-    """
-    Kirim alert ke Discord ketika temperature market ditemukan
-    tapi lokasinya tidak ada di LOCATION_REGISTRY.
-    Berguna agar kamu bisa tambahkan kota baru secara manual.
-    """
-    await notifier.notify_error(
-        title="🗺️ Kota Tidak Dikenal — Market Dilewati",
-        description=(
-            f"**Market temperature ditemukan tapi kota tidak dikenal:**\n"
-            f"```\n{market.question[:200]}\n```\n"
-            f"**Liquidity:** ${market.liquidity_usd:,.0f}\n"
-            f"**Hours to close:** {market.hours_to_close:.1f}h\n"
-            f"**Link:** {market.url}\n\n"
-            f"Tambahkan kota ke `LOCATION_REGISTRY` di `core/engine.py`\n"
-            f"Format: `\"nama kota\": (latitude, longitude)`"
-        ),
-    )
-    log.warning(
-        "[UNKNOWN CITY] %s | $%.0f liq | %.1fh to close",
-        market.question[:70], market.liquidity_usd, market.hours_to_close,
-    )
-
-
-# ── AQL Engine ────────────────────────────────────────────────────────────────
 
 class AQLEngine:
-    VERSION = "1.1.0"
+    VERSION = "2.0.0"
 
     def __init__(self) -> None:
-        self.breaker = CircuitBreaker()
+        self.breaker  = CircuitBreaker()
+        self.tracker  = PositionTracker()
+        self.cache    = MarketCache()
         log.info("AQL Engine v%s initialised.", self.VERSION)
+
+    # ── Bankroll Health ───────────────────────────────────────────────────────
+
+    async def _check_bankroll(self, bankroll_usd: float) -> bool:
+        if bankroll_usd < settings.MINIMUM_BANKROLL_HALT:
+            log.critical(
+                "Bankroll $%.2f di bawah minimum $%.2f",
+                bankroll_usd, settings.MINIMUM_BANKROLL_HALT,
+            )
+            await notifier.notify_error(
+                title="🚨 Bankroll Terlalu Kecil — Trading Dihentikan",
+                description=(
+                    f"Bankroll saat ini: **${bankroll_usd:.2f}**\n"
+                    f"Minimum: **${settings.MINIMUM_BANKROLL_HALT:.2f}**\n\n"
+                    f"Top up wallet lalu update `BANKROLL_USD` "
+                    f"di Railway → Variables."
+                ),
+            )
+            return False
+
+        if bankroll_usd < settings.MINIMUM_BANKROLL_WARNING:
+            log.warning("Bankroll $%.2f rendah.", bankroll_usd)
+            await notifier.notify_error(
+                title="⚠️ Bankroll Rendah",
+                description=(
+                    f"Bankroll saat ini: **${bankroll_usd:.2f}**\n"
+                    f"Disarankan minimum: **${settings.MINIMUM_BANKROLL_WARNING:.2f}**\n"
+                    f"Kelly sizing otomatis dikurangi.\n"
+                    f"Pertimbangkan top up segera."
+                ),
+            )
+        return True
+
+    # ── Confidence Scoring ────────────────────────────────────────────────────
+
+    def _compute_confidence(
+        self,
+        consensus,
+        horizon_days: int,
+    ) -> float:
+        """Confidence multiplier dari variance + horizon."""
+        variance_score = max(0.0, 1.0 - consensus.inter_model_variance)
+        horizon_score  = max(0.3, 1.0 - (horizon_days - 1) * 0.10)
+        raw            = 0.5 + ((variance_score + horizon_score) / 2 * 0.5)
+        return round(min(max(raw, 0.5), 1.0), 4)
+
+    # ── Process Single Market ─────────────────────────────────────────────────
 
     async def _process_market(
         self,
         http_client: httpx.AsyncClient,
-        market: PolyMarket,
+        market: TemperatureMarket,
         clob: CLOBExecutor,
         bankroll_usd: float,
+        trades_per_city: dict[str, int],
     ) -> bool:
-        """Full 9-step pipeline untuk satu market kandidat."""
+        """Full pipeline untuk satu market. Returns True jika trade placed."""
 
-        # [1] Resolve location
-        loc = _resolve_location(market.question)
-        if loc is None:
-            await _alert_unknown_location(market)
+        city    = market.city
+        gh_mult = market.golden_hour_mult
+        gh_status = GoldenHourStatus(market.golden_hour_status)
+
+        # [1] Max trades per city check
+        city_trades = trades_per_city.get(city.key, 0)
+        if city_trades >= settings.MAX_TRADES_PER_CITY:
+            log.debug(
+                "[Engine] Max %d trades untuk %s — skip",
+                settings.MAX_TRADES_PER_CITY, city.key,
+            )
             return False
 
-        city, lat, lon = loc
-        target_date = date.fromisoformat(market.end_date_iso[:10])
-
-        # Hitung horizon untuk confidence scoring
-        horizon_days = max((target_date - date.today()).days, 1)
-
-        # [2] Triple-Lock consensus dengan retry
-        consensus = await get_triple_lock_consensus(
-            lat, lon, city, target_date
+        # [2] Double entry check
+        target_date = market.end_date_iso[:10]
+        position_id = (
+            f"{city.key}-{market.market_type}-{target_date}"
+            .replace(" ", "_")
         )
-        if consensus is None:
-            log.warning("Consensus tidak tersedia untuk %s.", city)
+        if self.tracker.has_position(position_id):
+            log.debug(
+                "[Engine] Already has position %s — skip", position_id
+            )
             return False
 
-        # [3] Discord consensus update (selalu dikirim)
+        # [3] Hitung horizon
+        try:
+            target_dt   = date.fromisoformat(target_date)
+            horizon_days = max((target_dt - date.today()).days, 1)
+        except Exception:
+            horizon_days = 1
+
+        # [4] Cache check — perlu analisis?
+        current_price = (
+            market.outcomes[0].price
+            if market.outcomes
+            else market.mid_price
+        )
+        if not self.cache.should_analyze(market.cache_key, current_price):
+            log.debug("[Engine] Cache HIT %s — skip reanalysis", market.cache_key)
+            return False
+
+        # [5] Quad-Lock consensus
+        consensus = await get_triple_lock_consensus(
+            city.lat, city.lon, city.key, target_dt,
+        )
+
+        if consensus is None:
+            log.warning("[Engine] Consensus gagal untuk %s", city.key)
+            return False
+
+        # [6] Update cache
+        self.cache.set(
+            cache_key=market.cache_key,
+            condition_id=market.condition_id,
+            city_key=city.key,
+            target_date=target_date,
+            current_price=current_price,
+            consensus_mean_c=consensus.consensus_t_mean,
+            consensus_variance=consensus.inter_model_variance,
+            triple_lock=consensus.triple_lock,
+            expires=market.end_date_iso,
+        )
+
+        # [7] Discord consensus notification
         await notifier.notify_consensus_update(
-            location_name=city,
-            target_date=str(target_date),
+            location_name=city.key.title(),
+            target_date=target_date,
             ecmwf_mean=consensus.ecmwf.t_mean_c,
             gfs_mean=consensus.gfs.t_mean_c,
             noaa_mean=consensus.noaa.t_mean_c,
             consensus_mean=consensus.consensus_t_mean,
             variance=consensus.inter_model_variance,
             triple_lock=consensus.triple_lock,
+            icon_mean=consensus.icon.t_mean_c if consensus.icon else None,
+            model_count=consensus.model_count,
+            golden_hour_status=gh_status.value,
+            hours_to_close=market.htc,
         )
 
-        # [4] Triple-Lock gate
+        # [8] Triple-Lock gate
         if not consensus.triple_lock:
             log.info(
-                "[LOCK FAIL] %s Δ=%.2f°C — skip.",
-                city, consensus.inter_model_variance,
+                "[Engine] Lock failed %s Δ=%.2f°C",
+                city.key, consensus.inter_model_variance,
             )
             return False
 
-        # [5] Probability signal + edge
-        signal = compute_probability_signal(
-            consensus=consensus,
-            market_question=market.question,
-            market_price=market.mid_price,
-        )
-        if signal is None:
-            log.warning("Question unparseable: %s", market.question[:60])
-            return False
+        # [9] Min edge berdasarkan tier
+        min_edge = settings.get_min_edge(city.tier)
 
-        log.info(
-            "[SIGNAL] %s P(YES)=%.3f mkt=%.3f edge=%.2f%% → %s",
-            city, signal.prob_yes, signal.market_price,
-            signal.net_edge * 100, signal.signal,
-        )
+        # [10] Probability evaluation
+        signal: Optional[ProbabilitySignal] = None
+
+        if market.market_type == "MULTI_OUTCOME":
+            candidates = [
+                OutcomeCandidate(
+                    label=o.label,
+                    token_id=o.token_id,
+                    market_price=o.price,
+                    volume_24h=o.volume_24h,
+                )
+                for o in market.outcomes
+            ]
+            signal = evaluate_multi_outcome(
+                outcomes=candidates,
+                consensus=consensus,
+                city=city,
+                min_edge=min_edge,
+            )
+        else:
+            signal = evaluate_binary(
+                question=market.question,
+                yes_token_id=market.yes_token_id,
+                no_token_id=market.no_token_id,
+                market_price=market.mid_price,
+                consensus=consensus,
+                city=city,
+                min_edge=min_edge,
+                volume_24h=market.volume_usd,
+            )
+
+        if signal is None:
+            log.warning("[Engine] Signal gagal: %s", market.question[:60])
+            return False
 
         if signal.signal == "NO_TRADE":
             log.info(
-                "[NO TRADE] Edge %.2f%% di bawah minimum.",
-                signal.net_edge * 100,
+                "[Engine] NO_TRADE — edge %.2f%% < min %.2f%%",
+                signal.best_net_edge * 100, min_edge * 100,
             )
             return False
 
-        # [5b] Confidence multiplier berdasarkan variance + horizon
-        # Semakin kecil variance dan semakin dekat horizon → multiplier tinggi
-        variance_score  = max(0.0, 1.0 - consensus.inter_model_variance)
-        horizon_score   = max(0.3, 1.0 - (horizon_days - 1) * 0.10)
-        confidence_mult = round(0.5 + ((variance_score + horizon_score) / 2 * 0.5), 4)
-        confidence_mult = min(max(confidence_mult, 0.5), 1.0)
+        # [11] Big edge alert
+        if signal.best_net_edge >= settings.BIG_EDGE_THRESHOLD:
+            await notifier.notify_big_edge(
+                market_question=market.question,
+                outcome_label=signal.best_outcome_label,
+                edge_pct=signal.best_net_edge,
+                model_prob=signal.best_prob_model,
+                market_price=signal.best_market_price,
+                city=city.key.title(),
+            )
 
-        log.info(
-            "[CONFIDENCE] variance_score=%.3f horizon_score=%.3f mult=%.4f",
-            variance_score, horizon_score, confidence_mult,
-        )
+        # [12] Volume analysis
+        if market.market_type == "MULTI_OUTCOME" and market.outcomes:
+            volumes    = [o.volume_24h for o in market.outcomes]
+            avg_volume = calculate_avg_volume(volumes)
+            # Volume dari outcome yang market leading (harga tertinggi)
+            leading = max(market.outcomes, key=lambda o: o.price)
+            vol_signal = analyze_volume(
+                outcome_label=signal.best_outcome_label,
+                volume_24h=leading.volume_24h,
+                avg_volume=avg_volume,
+                forecast_outcome=signal.forecast_outcome,
+                market_leading_outcome=leading.label,
+            )
+        else:
+            from core.volume_analyzer import VolumeSignal
+            vol_signal = VolumeSignal(
+                has_spike=False,
+                spike_direction="NONE",
+                spike_magnitude=1.0,
+                kelly_multiplier=1.0,
+                warning_message="",
+            )
 
-        # [6] Kelly sizing dengan confidence multiplier
+        # Kirim volume warning jika berlawanan
+        if vol_signal.spike_direction == "AGAINST_FORECAST":
+            await notifier.notify_volume_warning(
+                market_question=market.question,
+                city=city.key.title(),
+                warning_message=vol_signal.warning_message,
+                spike_magnitude=vol_signal.spike_magnitude,
+            )
+
+        # [13] Confidence scoring
+        confidence_mult = self._compute_confidence(consensus, horizon_days)
+
+        # [14] Kelly sizing
         position = kelly_position(
-            signal,
-            bankroll_usd,
+            signal=signal,
+            bankroll_usd=bankroll_usd,
             confidence_multiplier=confidence_mult,
+            golden_hour_multiplier=gh_mult,
+            volume_multiplier=vol_signal.kelly_multiplier,
         )
+
         if position is None:
-            log.info("[NO TRADE] Kelly returned None (non-positive EV).")
+            log.info("[Engine] Kelly returned None — no positive EV")
             return False
 
         log.info(
-            "[SIZE] %s $%.2f | Kelly=%.5f | EV=$%.2f | conf=%.4f",
+            "[Engine] SIZE %s $%.2f | kelly=%.5f | "
+            "conf=%.3f gh=%.2f vol=%.2f final=%.4f",
             position.side, position.size_usd,
-            position.kelly_fraction, position.expected_value_usd,
-            confidence_mult,
+            position.kelly_fraction,
+            position.confidence_mult,
+            position.golden_hour_mult,
+            position.volume_mult,
+            position.final_mult,
         )
 
-        # [7] Circuit breaker check
+        # [15] Circuit breaker
         if self.breaker.is_open():
             await notifier.notify_error(
                 title="Trade Blocked — Circuit Breaker Active",
                 description="Reset via POST /admin/reset-breaker.",
                 is_circuit_breaker=True,
             )
+
+            # Notify missed opportunity
+            await notifier.notify_opportunity_missed(
+                market_question=market.question,
+                outcome_label=signal.best_outcome_label,
+                edge_pct=signal.best_net_edge,
+                reason="Circuit Breaker Active",
+            )
             return False
 
-        # [8] Submit order
+        # [16] Submit order
+        ask_price = (
+            signal.best_market_price
+            if signal.signal == "BUY_YES"
+            else (1.0 - signal.best_market_price)
+        )
         receipt = await clob.submit_order(
-            market, position.side, position.size_usd
+            token_id=signal.best_token_id,
+            size_usd=position.size_usd,
+            ask_price=ask_price,
         )
 
         if receipt is None:
-            # Order rejected (FOK tidak terisi) — BUKAN trade loss
-            self.breaker.record_loss(
-                pnl_usd=0,
-                loss_type=LossType.ORDER_REJECTED,
-            )
+            self.breaker.record_rejection()
             await notifier.notify_error(
                 title="Order Rejected — FOK Tidak Terisi",
                 description=(
                     f"Market: {market.question[:100]}\n"
-                    f"Side: {position.side} | "
-                    f"Size: ${position.size_usd:.2f}\n"
-                    f"Kemungkinan: liquiditas tidak cukup saat eksekusi."
+                    f"Outcome: {signal.best_outcome_label}\n"
+                    f"Size: ${position.size_usd:.2f}"
                 ),
             )
             return False
 
-        # [9] Trade notification
+        # [17] Add to position tracker
+        open_pos = build_position(
+            market_id=market.condition_id,
+            event_slug=market.event_slug,
+            token_id=signal.best_token_id,
+            city_key=city.key,
+            outcome_label=signal.best_outcome_label,
+            market_type=market.market_type,
+            entry_price=signal.best_market_price,
+            size_usd=position.size_usd,
+            expires=market.end_date_iso,
+        )
+        self.tracker.add(open_pos)
+
+        # [18] Update trades_per_city counter
+        trades_per_city[city.key] = city_trades + 1
+
+        # [19] Discord trade notification
         await notifier.notify_trade_executed(
             market_name=market.question,
             side=position.side,
-            price=position.market_price,
+            outcome_label=signal.best_outcome_label,
+            price=signal.best_market_price,
             size_usd=position.size_usd,
-            edge_pct=signal.net_edge,
+            edge_pct=signal.best_net_edge,
             ev_usd=position.expected_value_usd,
             kelly_fraction=position.kelly_fraction,
+            confidence_mult=position.confidence_mult,
+            golden_hour_mult=position.golden_hour_mult,
+            volume_mult=position.volume_mult,
+            final_mult=position.final_mult,
             market_url=market.url,
             order_id=receipt.get("orderID"),
+            all_outcomes=signal.all_outcomes,
+            forecast_outcome=signal.forecast_outcome,
+            model_mean_c=signal.model_mean_c,
+            model_std_c=signal.model_std_c,
+            golden_hour_status=gh_status.value,
+            market_type=market.market_type,
         )
 
         log.info(
-            "[TRADE] %s | %s | $%.2f",
-            market.question[:55], position.side, position.size_usd,
+            "[TRADE] %s | %s | %s | $%.2f",
+            city.key.upper(),
+            signal.best_outcome_label,
+            position.side,
+            position.size_usd,
         )
         return True
 
     # ── Scan Cycle ────────────────────────────────────────────────────────────
 
     async def run_scan_cycle(self, bankroll_usd: float = 200.0) -> None:
-        """Satu full discovery → filter → trade cycle."""
+        """Full unified scan cycle."""
         log.info(
-            "═══ AQL SCAN %s ═══",
+            "═══ AQL SCAN v%s  %s ═══",
+            self.VERSION,
             datetime.now(timezone.utc).isoformat(),
         )
 
-        # Bankroll health check
-        if not await _check_bankroll_health(bankroll_usd):
+        # Increment cache cycle
+        self.cache.increment_cycle()
+
+        # Bankroll check
+        if not await self._check_bankroll(bankroll_usd):
             return
 
         # Circuit breaker check
         if self.breaker.is_open():
-            log.critical("Circuit breaker open — scan dibatalkan.")
+            log.critical("Circuit breaker open — scan aborted.")
             await notifier.notify_error(
-                title="Scan Dibatalkan — Circuit Breaker Active",
+                title="Scan Aborted — Circuit Breaker Active",
                 description="Reset via POST /admin/reset-breaker.",
                 is_circuit_breaker=True,
             )
@@ -325,31 +447,78 @@ class AQLEngine:
         async with httpx.AsyncClient() as http:
             gamma  = GammaClient(http)
             clob   = CLOBExecutor(http)
-            window = settings.ENTRY_WINDOW_HOURS_BEFORE
+            exit_s = ExitStrategy(self.tracker)
 
-            markets = await gamma.discover_temperature_markets(
-                min_liquidity_usd=500.0,
-                hours_before_close_min=window - 1,
-                hours_before_close_max=window + 1,
-            )
+            # Update prices + check exit conditions
+            await exit_s.update_prices(http)
+            exit_results = await exit_s.check_and_exit(http)
+
+            # Notify exit results
+            for result in exit_results:
+                if result.reason == "EXPIRED":
+                    await notifier.notify_position_expired(
+                        position=result.position,
+                    )
+                else:
+                    await notifier.notify_exit_executed(
+                        position=result.position,
+                        reason=result.reason,
+                        exit_price=result.exit_price,
+                        pnl_usd=result.pnl_usd,
+                    )
+                    if result.is_win:
+                        self.breaker.record_win(
+                            pnl_usd=result.pnl_usd,
+                            region=self.tracker.get(
+                                result.position.position_id
+                            ) and "Unknown" or "Unknown",
+                            market_type=result.position.market_type,
+                            outcome_label=result.position.outcome_label,
+                        )
+                    else:
+                        self.breaker.record_loss(
+                            pnl_usd=result.pnl_usd,
+                            market_type=result.position.market_type,
+                            outcome_label=result.position.outcome_label,
+                        )
+
+            # Alert unknown cities
+            for unk in gamma.unknown_markets:
+                await notifier.notify_unknown_city(market=unk)
+
+            # Discover markets
+            markets = await gamma.discover_temperature_markets()
 
             if not markets:
-                log.info("Tidak ada market yang memenuhi syarat cycle ini.")
+                log.info("[Engine] Tidak ada market yang qualify.")
                 return
 
-            # Max 3 market diproses bersamaan
-            sem = asyncio.Semaphore(3)
+            # Group by city untuk max 2 trades enforcement
+            trades_per_city: dict[str, int] = {}
 
-            async def _safe(m: PolyMarket) -> bool:
+            # Sort: multi-outcome dulu (lebih banyak peluang),
+            # lalu binary, lalu by liquidity desc
+            def sort_key(m: TemperatureMarket) -> tuple:
+                type_priority = (
+                    0 if m.market_type == "MULTI_OUTCOME" else 1
+                )
+                return (type_priority, -m.liquidity_usd)
+
+            markets_sorted = sorted(markets, key=sort_key)
+
+            # Process dengan semaphore
+            sem = asyncio.Semaphore(settings.MAX_CONCURRENT_CITIES)
+
+            async def _safe(m: TemperatureMarket) -> bool:
                 async with sem:
                     try:
                         return await self._process_market(
-                            http, m, clob, bankroll_usd
+                            http, m, clob, bankroll_usd, trades_per_city
                         )
                     except Exception as e:
                         log.error(
-                            "Pipeline error [%s]: %s",
-                            m.market_id, e, exc_info=True,
+                            "[Engine] Pipeline error %s: %s",
+                            m.condition_id[:12], e, exc_info=True,
                         )
                         await notifier.notify_error(
                             title="Unhandled Pipeline Error",
@@ -359,10 +528,14 @@ class AQLEngine:
                         )
                         return False
 
-            results = await asyncio.gather(*[_safe(m) for m in markets])
+            results = await asyncio.gather(
+                *[_safe(m) for m in markets_sorted]
+            )
+            placed = sum(results)
+
             log.info(
-                "Cycle selesai. Trade: %d / %d kandidat.",
-                sum(results), len(markets),
+                "[Engine] Cycle done. Trades: %d / %d candidates.",
+                placed, len(markets),
             )
 
     # ── Forever Loop ──────────────────────────────────────────────────────────
@@ -371,23 +544,61 @@ class AQLEngine:
         """
         Infinite monitoring loop:
         - Daily PnL summary setiap tengah malam UTC
+        - Hourly heartbeat setiap jam
+        - Weekly report setiap Senin
         - Scan cycle setiap POLL_INTERVAL_SECONDS
-        - Auto-recovery dari crash dengan Discord notification
         """
-        await notifier.notify_startup(self.VERSION)
-        last_summary: Optional[date] = None
+        await notifier.notify_startup(
+            version=self.VERSION,
+            bankroll_usd=bankroll_usd,
+            registry_stats=__import__(
+                "core.location_registry",
+                fromlist=["registry_summary"]
+            ).registry_summary(),
+        )
+
+        last_summary_date: Optional[date]  = None
+        last_heartbeat_hour: Optional[int] = None
+        last_weekly_report: Optional[date] = None
 
         while True:
             try:
                 now = datetime.now(timezone.utc)
 
-                # Daily PnL summary di tengah malam UTC
-                if last_summary != now.date():
+                # Daily PnL summary tengah malam UTC
+                if last_summary_date != now.date():
                     await notifier.notify_daily_pnl_summary(
                         **self.breaker.get_daily_pnl_summary()
                     )
-                    last_summary = now.date()
+                    last_summary_date = now.date()
 
+                # Hourly heartbeat
+                if (
+                    settings.HOURLY_HEARTBEAT
+                    and last_heartbeat_hour != now.hour
+                ):
+                    cache_stats = self.cache.get_stats()
+                    pos_summary = self.tracker.get_summary()
+                    await notifier.notify_heartbeat(
+                        bankroll_usd=bankroll_usd,
+                        scan_cycle=cache_stats["current_cycle"],
+                        open_positions=pos_summary["open_count"],
+                        today_trades=self.breaker.state.get_today_stats().trades,
+                        today_pnl=self.breaker.state.get_today_stats().pnl_usd,
+                        cache_entries=cache_stats["total_entries"],
+                    )
+                    last_heartbeat_hour = now.hour
+
+                # Weekly report setiap Senin
+                if (
+                    now.weekday() == settings.WEEKLY_REPORT_DAY
+                    and last_weekly_report != now.date()
+                ):
+                    weekly = self.breaker.state.get_weekly_summary()
+                    await notifier.notify_weekly_report(weekly=weekly)
+                    last_weekly_report = now.date()
+
+                # Main scan
                 await self.run_scan_cycle(bankroll_usd=bankroll_usd)
 
             except KeyboardInterrupt:
