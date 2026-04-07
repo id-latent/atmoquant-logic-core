@@ -320,4 +320,4 @@ class PositionTracker:
                 }
                 for p in open_pos
             ],
-  }
+                }
