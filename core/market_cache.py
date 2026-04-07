@@ -249,4 +249,4 @@ class MarketCache:
             "analysis_total": sum(
                 e.analysis_count for e in self._cache.values()
             ),
-      }
+        }
