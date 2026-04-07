@@ -87,7 +87,6 @@ async def _post(payload: dict, target: str = "terminal") -> bool:
 # ── #📊-aql-terminal — Startup ────────────────────────────────────────────────
 
 async def notify_startup(
-    version: str,
     bankroll_usd: float,
     registry_stats: dict,
 ) -> None:
