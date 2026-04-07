@@ -466,8 +466,8 @@ class AQLEngine:
                         exit_price=result.exit_price,
                         pnl_usd=result.pnl_usd,
                     )
-                  
-                   # Ambil city region dari position tracker
+
+                    # Ambil city region dari position tracker
                     _pos = self.tracker.get(
                         result.position.position_id
                     )
@@ -490,7 +490,7 @@ class AQLEngine:
                             market_type=result.position.market_type,
                             outcome_label=result.position.outcome_label,
                         )
-            
+
             # Discover markets
             markets = await gamma.discover_temperature_markets()
 
@@ -498,7 +498,6 @@ class AQLEngine:
             for unk in gamma.unknown_markets:
                 await notifier.notify_unknown_city(market=unk)
 
-          
             if not markets:
                 log.info("[Engine] Tidak ada market yang qualify.")
                 return
