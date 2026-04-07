@@ -3,8 +3,7 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "python main.py"
-healthcheckPath = ""
+startCommand = "python -m uvicorn main:app --host 0.0.0.0 --port 8080"
+healthcheckPath = "/health"
 restartPolicy = "on_failure"
 restartPolicyMaxRetries = 10
-
