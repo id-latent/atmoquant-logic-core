@@ -558,13 +558,10 @@ class AQLEngine:
         - Weekly report setiap Senin
         - Scan cycle setiap POLL_INTERVAL_SECONDS
         """
+        from core.location_registry import registry_summary
         await notifier.notify_startup(
-            version=self.VERSION,
             bankroll_usd=bankroll_usd,
-            registry_stats=__import__(
-                "core.location_registry",
-                fromlist=["registry_summary"]
-            ).registry_summary(),
+            registry_stats=registry_summary(),
         )
 
         last_summary_date: Optional[date]  = None
