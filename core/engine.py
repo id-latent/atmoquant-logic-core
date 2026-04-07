@@ -466,29 +466,39 @@ class AQLEngine:
                         exit_price=result.exit_price,
                         pnl_usd=result.pnl_usd,
                     )
+                  
+                   # Ambil city region dari position tracker
+                    _pos = self.tracker.get(
+                        result.position.position_id
+                    )
+                    _region = (
+                        _pos.city_key.title()
+                        if _pos else "Unknown"
+                    )
+
                     if result.is_win:
                         self.breaker.record_win(
                             pnl_usd=result.pnl_usd,
-                            region=self.tracker.get(
-                                result.position.position_id
-                            ) and "Unknown" or "Unknown",
+                            region=_region,
                             market_type=result.position.market_type,
                             outcome_label=result.position.outcome_label,
                         )
                     else:
                         self.breaker.record_loss(
                             pnl_usd=result.pnl_usd,
+                            region=_region,
                             market_type=result.position.market_type,
                             outcome_label=result.position.outcome_label,
                         )
-
-            # Alert unknown cities
-            for unk in gamma.unknown_markets:
-                await notifier.notify_unknown_city(market=unk)
-
+            
             # Discover markets
             markets = await gamma.discover_temperature_markets()
 
+            # Alert unknown cities (setelah discover)
+            for unk in gamma.unknown_markets:
+                await notifier.notify_unknown_city(market=unk)
+
+          
             if not markets:
                 log.info("[Engine] Tidak ada market yang qualify.")
                 return
