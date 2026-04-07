@@ -214,4 +214,4 @@ class ExitStrategy:
                 log.debug(
                     "[Exit] Price update failed %s: %s",
                     pos.position_id, str(e),
-                                  )
+                )
