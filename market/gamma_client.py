@@ -546,44 +546,52 @@ class GammaClient:
     # ── Titik Masuk Utama ──────────────────────────────────────────────────
 
     async def discover_temperature_markets(
-        self,
-        min_liquidity_usd:      float = 500.0,
-        hours_before_close_min: float = 1.0,
-        hours_before_close_max: float = 168.0,
-    ) -> list[TemperatureMarket]:
-        """
-        Discovery terpadu v2.1.0.
-        Return: list[TemperatureMarket] — sudah diperkaya & siap diproses engine.
-        """
-        log.info("Discovery terpadu v2.1.0 — mulai")
-
-        event_markets, seen_cids = await self._discover_events()
-        binary_markets           = await self._discover_binary_markets(seen_cids)
-        all_markets              = event_markets + binary_markets
-
-        log.info(
-            "Total mentah: %d MULTI_OUTCOME + %d BINARY = %d",
-            len(event_markets), len(binary_markets), len(all_markets),
-        )
-
-        # Filter liquidity + htc window
-        filtered: list[PolyMarket] = []
-        for pm in all_markets:
-            if pm.liquidity_usd < min_liquidity_usd:
-                continue
-            if not (hours_before_close_min <= pm.htc <= hours_before_close_max):
-                continue
-            filtered.append(pm)
-            log.info(
-                "[KANDIDAT] %s | %.1fh | $%.0f | %s",
-                pm.market_type, pm.htc, pm.liquidity_usd, pm.question[:70],
-            )
-
-        filtered.sort(key=lambda m: m.liquidity_usd, reverse=True)
-        log.info("Kandidat setelah filter: %d", len(filtered))
-
-        # Enrich → TemperatureMarket (termasuk golden hour check & city lookup)
-        return self.enrich_markets(filtered)
+    self,
+    min_liquidity_usd: float = 500.0,
+    hours_before_close_min: float = 1.0,
+    hours_before_close_max: float = 168.0,
+) -> list[TemperatureMarket]:
+    """Discovery terpadu v2.2.0 — PARALLEL EVENTS + BINARY (35s→15s)."""
+    import time
+    start_total = time.time()
+    
+    log.info("🔥 Discovery v2.2 PARALLEL — mulai")
+    
+    events_task, binary_task = await asyncio.gather(
+        self.discoverevents(),
+        self.discoverbinarymarkets(set()),
+        return_exceptions=True
+    )
+    
+    if isinstance(events_task, Exception):
+        log.warning("Events task failed: %s", events_task)
+        event_markets, seen_cids = [], set()
+    else:
+        event_markets, seen_cids = events_task
+        
+    if isinstance(binary_task, Exception):
+        log.warning("Binary task failed: %s", binary_task)
+        binary_markets = []
+    else:
+        binary_markets = binary_task
+    
+    all_markets = event_markets + binary_markets
+    log.info("Parallel done: %d MULTI + %d BINARY = %d | %.1fs",
+             len(event_markets), len(binary_markets), len(all_markets),
+             time.time() - start_total)
+    
+    filtered: list[PolyMarket] = []
+    for pm in all_markets:
+        if pm.liquidity_usd < min_liquidity_usd: continue
+        if not (hours_before_close_min <= pm.htc <= hours_before_close_max): continue
+        filtered.append(pm)
+    
+    filtered.sort(key=lambda m: m.liquidity_usd, reverse=True)
+    log.info("Kandidat: %d | Total time: %.1fs", len(filtered), time.time() - start_total)
+    
+    enriched = self.enrich_markets(filtered)
+    log.info("✅ Parallel Discovery: %d market siap engine", len(enriched))
+    return enriched
 
     # ── Refresh Harga ──────────────────────────────────────────────────────
 
