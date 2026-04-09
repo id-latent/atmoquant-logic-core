@@ -1,0 +1,38 @@
+# ==============================================================================
+# .dockerignore — Exclude file sensitif dan tidak perlu dari Docker image
+# ==============================================================================
+
+# Env vars — JANGAN PERNAH masuk ke image
+.env
+.env.*
+!.env.example
+
+# Data runtime — state.json dibuat ulang saat startup
+data/state.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Development
+.git/
+.gitignore
+*.md
+!README.md
+
+# Test files — tidak diperlukan di production
+test_*.py
+*_test.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
