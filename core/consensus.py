@@ -155,14 +155,22 @@ async def _fetch_once(
     endpoint     = MODEL_ENDPOINTS[model_name]
     extra_params = MODEL_PARAMS[model_name]
 
+    # ── Hitung berapa hari ke depan target_date dari hari ini ──────────────
+    # Open-Meteo tidak suka start_date=end_date=today bersamaan dengan
+    # forecast_days — menyebabkan HTTP 400. Solusi: gunakan forecast_days
+    # saja (tanpa start_date/end_date), lalu ambil data dari index yang tepat.
+    from datetime import date as _date
+    today        = _date.today()
+    horizon_days = max((target_date - today).days, 0)
+    # Minta minimal 1 hari ke depan, maksimal 7
+    n_days       = max(horizon_days + 1, 1)
+
     params = {
         "latitude":      latitude,
         "longitude":     longitude,
         "daily":         "temperature_2m_max,temperature_2m_min,temperature_2m_mean",
         "timezone":      "UTC",
-        "start_date":    target_date.isoformat(),
-        "end_date":      target_date.isoformat(),
-        "forecast_days": 7,
+        "forecast_days": min(n_days, 7),  # Open-Meteo max 7 hari gratis
         **extra_params,
     }
 
@@ -175,9 +183,19 @@ async def _fetch_once(
         log.warning("[%s] Empty daily block untuk %s", model_name, target_date)
         return None
 
-    t_max  = daily["temperature_2m_max"][0]
-    t_min  = daily["temperature_2m_min"][0]
-    t_mean = daily["temperature_2m_mean"][0]
+    # Cari index yang sesuai dengan target_date
+    target_str = target_date.isoformat()
+    times      = daily.get("time", [])
+    try:
+        idx = times.index(target_str)
+    except ValueError:
+        # target_date tidak ada di response — ambil index terakhir
+        idx = len(times) - 1
+        log.debug("[%s] target_date %s tidak ada, pakai idx=%d", model_name, target_str, idx)
+
+    t_max  = daily["temperature_2m_max"][idx]
+    t_min  = daily["temperature_2m_min"][idx]
+    t_mean = daily["temperature_2m_mean"][idx]
 
     if any(v is None for v in [t_max, t_min, t_mean]):
         log.warning("[%s] Null values untuk %s", model_name, target_date)
