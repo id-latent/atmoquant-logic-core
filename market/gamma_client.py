@@ -226,23 +226,45 @@ class GammaClient:
         markets: list[PolyMarket] = []
         seen:    set[str]         = set()
 
-        try:
-            page = await self._get(
-                "/events",
-                params={
-                    "active":     "true",
-                    "closed":     "false",
-                    "limit":      50,
-                    "order":      "volumeNum",
-                    "ascending":  "false",
-                },
-            )
-        except Exception as e:
-            log.warning("Events API tidak tersedia: %s — fallback ke /markets saja", e)
+        # Fetch tanpa filter tag — kompatibel dengan API Polymarket terbaru
+        all_events: list[dict] = []
+        for limit_val in [100, 50]:
+            try:
+                page = await self._get(
+                    "/events",
+                    params={
+                        "active":    "true",
+                        "closed":    "false",
+                        "limit":     limit_val,
+                        "order":     "volumeNum",
+                        "ascending": "false",
+                    },
+                )
+                raw = page if isinstance(page, list) else page.get("events", [])
+                if raw:
+                    all_events = raw
+                    log.info("Events API: %d events diterima (limit=%d)", len(raw), limit_val)
+                    break
+            except Exception as e:
+                log.warning("Events API gagal (limit=%d): %s", limit_val, e)
+
+        if not all_events:
+            log.warning("Events API tidak tersedia — fallback ke /markets saja")
             return markets, seen
 
-        events = page if isinstance(page, list) else page.get("events", [])
-        log.info("Events API: %d event suhu diterima", len(events))
+        # Filter hanya event suhu
+        events = [
+            e for e in all_events
+            if _is_temperature_market({
+                "question":    e.get("title") or e.get("question") or "",
+                "description": e.get("description") or "",
+                "tags": [
+                    t.get("slug", "") if isinstance(t, dict) else str(t)
+                    for t in (e.get("tags") or [])
+                ],
+            })
+        ]
+        log.info("Events suhu: %d / %d total", len(events), len(all_events))
 
         for event in events:
             event_markets = event.get("markets") or []
