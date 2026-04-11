@@ -39,7 +39,7 @@ log = logging.getLogger("aql.consensus")
 
 # ── Retry Config ──────────────────────────────────────────────────────────────
 MAX_RETRIES    = 3
-BASE_DELAY_SEC = 1.5
+BASE_DELAY_SEC = 2.0  # Lebih lama agar tidak kena rate limit berulang
 
 # ── Model Endpoints ───────────────────────────────────────────────────────────
 MODEL_ENDPOINTS: dict[str, str] = {
@@ -290,12 +290,15 @@ async def get_triple_lock_consensus(
     dari t_mean semua model aktif, bukan range (max-min).
     """
     async with httpx.AsyncClient() as client:
-        ecmwf, gfs, noaa, icon = await asyncio.gather(
-            _fetch_with_retry(client, "ECMWF", latitude, longitude, target_date),
-            _fetch_with_retry(client, "GFS",   latitude, longitude, target_date),
-            _fetch_with_retry(client, "NOAA",  latitude, longitude, target_date),
-            _fetch_with_retry(client, "ICON",  latitude, longitude, target_date),
-        )
+        # Tambah jitter kecil antar model untuk menghindari rate limit Open-Meteo
+        # Saat banyak market diproses bersamaan, semua hit API sekaligus → 429
+        ecmwf = await _fetch_with_retry(client, "ECMWF", latitude, longitude, target_date)
+        await asyncio.sleep(0.5)  # 500ms jeda
+        gfs   = await _fetch_with_retry(client, "GFS",   latitude, longitude, target_date)
+        await asyncio.sleep(0.5)
+        noaa  = await _fetch_with_retry(client, "NOAA",  latitude, longitude, target_date)
+        await asyncio.sleep(0.3)
+        icon  = await _fetch_with_retry(client, "ICON",  latitude, longitude, target_date)
 
     if any(m is None for m in [ecmwf, gfs, noaa]):
         log.error(
