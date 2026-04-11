@@ -119,7 +119,7 @@ class AQLSettings:
 
     # ── Position & Trade Limits ────────────────────────────────────────────────
     MAX_TRADES_PER_CITY: int       = 2      # Max 2 trades per kota per scan
-    MAX_CONCURRENT_CITIES: int     = 5      # Max concurrent market processing
+    MAX_CONCURRENT_CITIES: int     = 2      # Max concurrent market processing — dikurangi dari 5 ke 2 untuk menghindari rate limit Open-Meteo
     # MAX_CONCURRENT_PER_CITY tidak diimplementasikan sebagai semaphore
     # terpisah di engine.py saat ini — nilainya mengikuti MAX_TRADES_PER_CITY
     MAX_CONCURRENT_PER_CITY: int   = 2
