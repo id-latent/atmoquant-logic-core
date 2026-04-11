@@ -513,7 +513,7 @@ class GammaClient:
 
     async def discover_temperature_markets(
         self,
-        min_liquidity_usd: float = 500.0,
+        min_liquidity_usd: float = 50.0,
         hours_before_close_min: float = 1.0,
         hours_before_close_max: float = 168.0,
     ) -> list[TemperatureMarket]:
@@ -560,8 +560,16 @@ class GammaClient:
         filtered: list[PolyMarket] = []
         for pm in all_markets:
             if pm.liquidity_usd < min_liquidity_usd:
+                log.info(
+                    "SKIP liquidity $%.0f < $%.0f: %s",
+                    pm.liquidity_usd, min_liquidity_usd, pm.question[:60]
+                )
                 continue
             if not (hours_before_close_min <= pm.htc <= hours_before_close_max):
+                log.info(
+                    "SKIP HTC %.1fh (range %.1f-%.1fh): %s",
+                    pm.htc, hours_before_close_min, hours_before_close_max, pm.question[:60]
+                )
                 continue
             filtered.append(pm)
 
