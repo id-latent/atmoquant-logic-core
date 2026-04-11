@@ -226,27 +226,29 @@ class GammaClient:
         markets: list[PolyMarket] = []
         seen:    set[str]         = set()
 
-        # Fetch tanpa filter tag — kompatibel dengan API Polymarket terbaru
+        # ── Strategi baru berdasarkan dokumentasi resmi Polymarket ──────────
+        # Parameter filter yang benar adalah tag_id (integer), bukan tag (string)
+        # Tag ID untuk temperature/cuaca berdasarkan data live Polymarket:
+        #   - Kita fetch /events tanpa filter, ambil 500 events terbaru
+        #   - Filter sendiri menggunakan _is_temperature_market()
+        # Ini lebih robust daripada bergantung pada tag_id yang bisa berubah
         all_events: list[dict] = []
-        for limit_val in [100, 50]:
-            try:
-                page = await self._get(
-                    "/events",
-                    params={
-                        "active":    "true",
-                        "closed":    "false",
-                        "limit":     limit_val,
-                        "order":     "volumeNum",
-                        "ascending": "false",
-                    },
-                )
-                raw = page if isinstance(page, list) else page.get("events", [])
-                if raw:
-                    all_events = raw
-                    log.info("Events API: %d events diterima (limit=%d)", len(raw), limit_val)
-                    break
-            except Exception as e:
-                log.warning("Events API gagal (limit=%d): %s", limit_val, e)
+        try:
+            page = await self._get(
+                "/events",
+                params={
+                    "active":    "true",
+                    "closed":    "false",
+                    "limit":     500,           # Ambil banyak — filter sendiri
+                    "order":     "volume24hr",  # Urutkan dari yang paling aktif
+                    "ascending": "false",
+                },
+            )
+            raw = page if isinstance(page, list) else page.get("events", [])
+            all_events = raw
+            log.info("Events API: %d events diterima", len(raw))
+        except Exception as e:
+            log.warning("Events API gagal: %s — fallback ke /markets saja", e)
 
         if not all_events:
             log.warning("Events API tidak tersedia — fallback ke /markets saja")
@@ -347,7 +349,7 @@ class GammaClient:
         exclude_cids: set[str],
     ) -> list[PolyMarket]:
         markets: list[PolyMarket] = []
-        offset, limit, MAX_PAGES  = 0, 100, 5
+        offset, limit, MAX_PAGES  = 0, 100, 10  # Lebih banyak halaman = lebih banyak market ditemukan
 
         while (offset // limit) < MAX_PAGES:
             try:
@@ -358,7 +360,7 @@ class GammaClient:
                         "closed":     "false",
                         "limit":      limit,
                         "offset":     offset,
-                        "order":      "volumeNum",
+                        "order":      "volume24hr",  # Urutkan dari yang paling aktif hari ini
                         "ascending":  "false",
                     },
                 )
