@@ -1,0 +1,24 @@
+# ==============================================================================
+# requirements-dev.txt — Development & Testing Dependencies
+# JANGAN install ini di production Railway
+# Gunakan untuk: pytest lokal, CI/CD, linting
+# ==============================================================================
+#
+# Install: pip install -r requirements-dev.txt
+# Run test: pytest
+#
+
+# ── Test Framework ──────────────────────────────────────────────────────────────
+pytest==8.2.0
+pytest-asyncio==0.23.6      # Support async/await tests
+respx==0.21.1               # Mock httpx HTTP calls (bukan requests!)
+
+# ── Production deps (diperlukan untuk menjalankan kode yang dites) ─────────────
+# Uncomment jika belum install dari requirements.txt:
+# -r requirements.txt
+
+# ── Optional: Code Quality ─────────────────────────────────────────────────────
+# Uncomment untuk linting (tidak wajib untuk test):
+# ruff==0.4.4               # Fast linter (pengganti flake8/pylint)
+# mypy==1.10.0              # Type checking
+# black==24.4.2             # Formatter
